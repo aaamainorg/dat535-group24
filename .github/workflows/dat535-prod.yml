@@ -1,0 +1,76 @@
+name: DAT535 - Production Pipeline
+
+# Runs when code reaches main (after a reviewed pull request dev -> main), or by hand.
+# Uses the "main" environment: if it has required reviewers, the run waits for an approval click.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: Stage to run
+        required: true
+        default: all
+        type: choice
+        options: [all, bronze]
+
+# Prod runs (this file and pipeline.yml) never overlap: they share ~/dat535-data/prod.
+concurrency:
+  group: dat535-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: self-hosted
+    environment: main
+    env:
+      DAT535_ENV: prod
+      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve output directory
+        id: output-dir
+        run: echo "dir=$HOME/dat535-data/prod" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python and Java
+        run: bash scripts/setup_env.sh
+
+      - name: Unit tests
+        run: pytest -q tests/
+
+      - name: Run Production Pipeline
+        env:
+          DAT535_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
+        run: |
+          mkdir -p "$DAT535_OUTPUT_DIR"
+          STAGE="${{ github.event.inputs.stage || 'all' }}"
+          echo "=== Running Production Pipeline ($STAGE) ==="
+          python run_pipeline.py "$STAGE"
+
+      - name: Upload Production manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-manifest-${{ github.run_number }}
+          path: ${{ steps.output-dir.outputs.dir }}/bronze/_manifest.csv
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Write pipeline summary
+        if: always()
+        run: |
+          MANIFEST="${{ steps.output-dir.outputs.dir }}/bronze/_manifest.csv"
+          echo "## Production Pipeline Run" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Run # | ${{ github.run_number }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stage | ${{ github.event.inputs.stage || 'all' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | ${{ github.actor }} (${{ github.event_name }}) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Branch | ${{ github.ref_name }} |" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$MANIFEST" ]; then
+            python scripts/manifest_summary.py "$MANIFEST" >> "$GITHUB_STEP_SUMMARY"
+          fi

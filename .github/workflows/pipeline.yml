@@ -1,0 +1,62 @@
+name: Pipeline
+
+# Scheduled production refresh. Elhub publishes a month's data after the month ends,
+# so once a month is enough. Also startable by hand.
+#
+# NOTE for a runner on your own laptop: a scheduled run only starts if the runner is
+# online at that moment. If the laptop was asleep, the run waits in the queue until the
+# runner comes online (or is dropped after 24 h) - then just start it by hand.
+#
+# Unlike dat535-prod.yml this has no approval step: it only re-runs code that is already
+# reviewed and merged to main, and a scheduled run nobody approves would never start.
+on:
+  workflow_dispatch:
+  schedule:
+    # Alternative intervals (uncomment one and comment out the active line below):
+    #- cron: "0 6 * * *"     # every day at 06:00 UTC
+    #- cron: "0 6 * * 1"     # every Monday at 06:00 UTC
+    - cron: "0 6 5 * *"      # active: monthly, the 5th at 06:00 UTC (last month's Elhub data is ready)
+
+concurrency:
+  group: dat535-prod
+  cancel-in-progress: false
+
+jobs:
+  run-pipeline:
+    name: Run PySpark Pipeline (scheduled, prod)
+    runs-on: self-hosted
+    env:
+      DAT535_ENV: prod
+      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: main                      # always the reviewed production code
+
+      - name: Resolve output directory
+        id: output-dir
+        run: echo "dir=$HOME/dat535-data/prod" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python and Java
+        run: bash scripts/setup_env.sh
+
+      - name: Run Pipeline
+        env:
+          DAT535_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
+        run: |
+          mkdir -p "$DAT535_OUTPUT_DIR"
+          echo "=== Starting Data Pipeline Execution ==="
+          python run_pipeline.py all
+          echo ""
+          echo "=== All Pipelines Completed Successfully ==="
+
+      - name: Write pipeline summary
+        if: always()
+        run: |
+          MANIFEST="${{ steps.output-dir.outputs.dir }}/bronze/_manifest.csv"
+          echo "## Scheduled Pipeline Run #${{ github.run_number }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$MANIFEST" ]; then
+            python scripts/manifest_summary.py "$MANIFEST" >> "$GITHUB_STEP_SUMMARY"
+          fi
