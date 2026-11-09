@@ -1,0 +1,9 @@
+# Python packages for the DAT535 Group 24 pipeline.
+# Bronze ingestion itself only uses the standard library; these are for
+# Spark (profiling, Silver, Gold), the notebooks and the tests.
+pyspark          # use the same version as Spark on the server (/opt/spark)
+pandas
+pyarrow
+pytest
+jupyter
+ipykernel
