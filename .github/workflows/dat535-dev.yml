@@ -24,6 +24,7 @@ jobs:
       DAT535_ENV: dev
       FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}   # optional; empty -> Frost source is skipped
 
+      
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
