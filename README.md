@@ -16,7 +16,7 @@ started (1 October 2025), taking temperature into account – and where is the c
 
 | Layer | Status | Where |
 |---|---|---|
-| Scope, dataset, Bronze | ✅ done | `notebooks/01_scope_dataset_bronze.ipynb`, `bronze_pipeline.py` |
+| Scope, dataset, Bronze | ✅ done | `notebooks/01_bronze.ipynb`, `bronze_pipeline.py` |
 | Silver | ⏳ next | – |
 | Gold + dashboard | ⏳ | – |
 
@@ -30,22 +30,22 @@ started (1 October 2025), taking temperature into account – and where is the c
 ├── run_pipeline.py                        # one entry point: python run_pipeline.py bronze | all
 ├── bronze_pipeline.py                     # Bronze ingestion (generated from notebook 01, sections 3.1-3.9)
 ├── notebooks/
-│   └── 01_scope_dataset_bronze.ipynb      # sections 1-3 of the project definition, every line explained
+│   └── 01_bronze.ipynb      # sections 1-3 of the project definition, every line explained
 ├── tests/
 │   └── test_bronze.py                     # pytest, no internet or Spark needed
 ├── scripts/
 │   ├── setup_env.sh                       # prepares Python venv + Java (used by every workflow)
 │   └── manifest_summary.py                # writes the Bronze run table on the GitHub Actions run page
 └── .github/workflows/
-    ├── dat535-dev.yml                     # push to dev / manual       -> tests + pipeline into ~/dat535-data/dev
-    ├── dat535-prod.yml                    # push to main / manual      -> tests + pipeline into ~/dat535-data/prod (approval)
-    └── pipeline.yml                       # monthly schedule / manual  -> pipeline into ~/dat535-data/prod
+    ├── dat535-dev.yml                     # push to dev / manual       -> tests + pipeline into ~/norgespris-data/dev
+    ├── dat535-prod.yml                    # push to main / manual      -> tests + pipeline into ~/norgespris-data/prod (approval)
+    └── pipeline.yml                       # monthly schedule / manual  -> pipeline into ~/norgespris-data/prod
 ```
 
 Data is **not** stored in git. It lives on the server:
 
 ```text
-~/dat535-data/<dev|prod>/
+~/norgespris-data/<dev|prod>/
 ├── landing/<source>/<dataset>/            # put manual exports here (Seklima, ...)
 └── bronze/
     ├── _manifest.csv                      # one line per file: source, time, size, SHA-256, status
@@ -55,7 +55,7 @@ Data is **not** stored in git. It lives on the server:
 ## Setup: GitHub Actions runner on your own machine (once)
 
 All three workflows use `runs-on: self-hosted`, so they run on **your computer** through a GitHub runner.
-Data goes to `~/dat535-data/dev` and `~/dat535-data/prod` on that computer – the same folders the notebook uses.
+Data goes to `~/norgespris-data/dev` and `~/norgespris-data/prod` on that computer – the same folders the notebook uses.
 
 1. **Python and Java on the machine.**
    - Python 3.9+ (`python3 --version`)
@@ -85,7 +85,7 @@ Data goes to `~/dat535-data/dev` and `~/dat535-data/prod` on that computer – t
    - **Locally (notebook / terminal):** put it in `.env` in the repo root – see *Credentials* below.
    - **GitHub Actions:** add it as repository secret `FROST_CLIENT_ID` (*Settings → Secrets and variables → Actions*).
 
-6. **Manual files (only as fallback).** Any dataset can be fed by hand via `~/dat535-data/<dev|prod>/landing/<source>/<dataset>/`,
+6. **Manual files (only as fallback).** Any dataset can be fed by hand via `~/norgespris-data/<dev|prod>/landing/<source>/<dataset>/`,
    e.g. a Seklima export in `landing/met/seklima_daily_mean_temperature/` if Frost is down.
 
 **Security:** a self-hosted runner executes whatever the workflow says on your computer. That is why the workflows
@@ -98,9 +98,9 @@ start it by hand: *Actions → Pipeline → Run workflow*.
 
 | Workflow | Trigger | Environment | Data folder |
 |---|---|---|---|
-| `dat535-dev.yml` | push to `dev`, manual | `dev` | `~/dat535-data/dev` |
-| `dat535-prod.yml` | push to `main` (after PR), manual with stage choice | `main` (approval) | `~/dat535-data/prod` |
-| `pipeline.yml` | monthly (5th, 06:00 UTC), manual | – | `~/dat535-data/prod` |
+| `norgespris-dev.yml` | push to `dev`, manual | `dev` | `~/norgespris-data/dev` |
+| `norgespris-prod.yml` | push to `main` (after PR), manual with stage choice | `main` (approval) | `~/norgespris-data/prod` |
+| `pipeline.yml` | monthly (5th, 06:00 UTC), manual | – | `~/norgespris-data/prod` |
 
 Each run shows the Bronze manifest as a table on the run page (prod) and uploads `_manifest.csv` as an artifact.
 Prod runs never overlap (`concurrency` group), because they write to the same folder.
@@ -128,8 +128,8 @@ cp .env.example .env      # once, in the repo root
 ```bash
 source ~/spark-env/bin/activate
 
-python run_pipeline.py bronze            # dev by default -> ~/dat535-data/dev
-NORGESPRIS_ENV=prod NORGESPRIS_OUTPUT_DIR=~/dat535-data/prod python run_pipeline.py bronze   # by hand in prod
+python run_pipeline.py bronze            # dev by default -> ~/norgespris-data/dev
+NORGESPRIS_ENV=prod NORGESPRIS_OUTPUT_DIR=~/norgespris-data/prod python run_pipeline.py bronze   # by hand in prod
 
 pytest -q tests/                         # unit tests
 jupyter notebook notebooks/              # the notebooks
