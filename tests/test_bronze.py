@@ -202,17 +202,39 @@ def test_frost_requests_groups_months_and_skips(landing, monkeypatch):
     reqs = bp.frost_observation_requests(state, FROST_OBS)
     assert len(reqs) == 3 * 2                                             # 3 months x 2 groups
     url, month, filename = reqs[0]
-    assert month == "2025-08" and filename == "frost_obs_2025-08_g01.json"
+    assert month == "2025-08" and filename.startswith("frost_obs_2025-08_l")
+    assert filename.endswith("_g01.json")
     assert "sources=SN1,SN2" in url and "referencetime=2025-08-01/2025-09-01" in url  # sorted, ":0" removed
 
     state["manifest"] += [{"dataset": "frost_observations", "status": s, "original_filename": f}
-                          for s, f in [("ingested", "frost_obs_2025-08_g01.json"),
-                                       ("no_data", "frost_obs_2025-08_g02.json"),
-                                       ("ingested", "frost_obs_2025-10_g01.json")]]
+                          for s, f in [("ingested", reqs[0][2]),
+                                       ("no_data", reqs[1][2]),
+                                       ("ingested", reqs[-2][2])]]
     names = [r[2] for r in bp.frost_observation_requests(state, FROST_OBS)]
-    assert "frost_obs_2025-08_g01.json" not in names                      # stored -> skipped
-    assert "frost_obs_2025-08_g02.json" not in names                      # known empty -> skipped
-    assert "frost_obs_2025-10_g01.json" in names                          # recent month -> asked again
+    assert reqs[0][2] not in names                                        # stored -> skipped
+    assert reqs[1][2] not in names                                        # known empty -> skipped
+    assert reqs[-2][2] in names                                           # recent month -> asked again
+
+
+def test_frost_station_membership_changes_request_identity(landing, monkeypatch):
+    monkeypatch.setattr(bp, "ENV", "dev")
+    monkeypatch.setenv("NORGESPRIS_DEV_START_MONTH", "2025-08")
+    monkeypatch.setenv("NORGESPRIS_DEV_END_MONTH", "2025-08")
+    monkeypatch.setattr(bp, "FROST_STATIONS_PER_REQUEST", 2)
+    ids = ["SN1", "SN2", "SN3"]
+    monkeypatch.setattr(bp, "frost_station_ids", lambda state: ids)
+    state = {"manifest": []}
+
+    original = bp.frost_observation_requests(state, FROST_OBS)
+    state["manifest"] += [
+        {"dataset": "frost_observations", "status": "ingested", "original_filename": filename}
+        for _, _, filename in original
+    ]
+    ids.append("SN0")
+
+    changed = bp.frost_observation_requests(state, FROST_OBS)
+    assert len(changed) == 2
+    assert {r[2] for r in changed}.isdisjoint({r[2] for r in original})
 
 
 def test_frost_404_is_no_data_not_failure(landing, monkeypatch):

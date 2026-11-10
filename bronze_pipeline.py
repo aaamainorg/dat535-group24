@@ -361,6 +361,7 @@ def frost_observation_requests(state, cfg):
         return []
     n = FROST_STATIONS_PER_REQUEST
     groups = [ids[i:i + n] for i in range(0, len(ids), n)]       # [[SN..100 ids], [SN..], ...]
+    layout = hashlib.sha256(",".join(ids).encode("utf-8")).hexdigest()[:12]
     start, end = month_range()                                   # period for dev or prod, from .env
     months = month_list(start, end or last_complete_month())     # None = up to the last complete month
     recent = set(months[-REDOWNLOAD_RECENT_MONTHS:])             # always re-request the newest months
@@ -369,7 +370,7 @@ def frost_observation_requests(state, cfg):
     requests = []
     for month in months:
         for g, group in enumerate(groups, start=1):
-            filename = f"frost_obs_{month}_g{g:02d}.json"         # e.g. frost_obs_2025-10_g03.json
+            filename = f"frost_obs_{month}_l{layout}_g{g:02d}.json"
             if filename in have and month not in recent:         # already stored and not recent -> skip
                 continue
             url = cfg["url"].format(sources=",".join(group),     # SN18700,SN18950,...
