@@ -381,7 +381,7 @@ def frost_observation_requests(state, cfg):
 def run_bronze():
     """Run Bronze ingestion for all sources and return a summary dict."""
     start_time = time.time()
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")  # e.g. 20261109T201500Z
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")  # microseconds keep rapid runs apart
     state = {"run_id": run_id,                                 # shared state for the helper functions
              "tmp_dir": os.path.join(BRONZE_DIR, "_tmp", run_id),
              "manifest": read_manifest(),                      # everything ingested in earlier runs
