@@ -1,6 +1,0 @@
-9d79d8b1-293b-466e-8a9c-eb5f12641e2d
-
-1d65b5f9-0731-4757-827f-cd03d5d15ede
-
-
-I need mean temrature for each municipality from frost api. assume that i have a key and password to access the call. create .env file with credentials and update the lates bronze notebook to read from frost api 
