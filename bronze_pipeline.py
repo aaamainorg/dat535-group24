@@ -79,6 +79,10 @@ def month_range():
             continue
         if len(value) != 7 or value[4] != "-" or not (value[:4] + value[5:]).isdigit():  # must look like YYYY-MM
             raise ValueError(f"{key} must be set as YYYY-MM in .env (or as environment variable), got '{value}'")
+        try:
+            date.fromisoformat(f"{value}-01")
+        except ValueError as e:
+            raise ValueError(f"{key} must be a valid calendar month (YYYY-MM), got '{value}'") from e
     return start, end
 
 
