@@ -1,5 +1,8 @@
 name: Norgespris - Dev Pipeline
 
+permissions:
+  contents: read
+
 # Runs automatically on every push to the dev branch, and by hand
 # (Actions tab -> "DAT535 - Dev Pipeline" -> Run workflow).
 # No pull_request trigger on purpose: the runner is your own machine, and in a public

@@ -1,5 +1,8 @@
 name: Norgespris - Production Pipeline
 
+permissions:
+  contents: read
+
 # Runs when code reaches main (after a reviewed pull request dev -> main), or by hand.
 # Uses the "main" environment: if it has required reviewers, the run waits for an approval click.
 on:

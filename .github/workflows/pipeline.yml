@@ -1,5 +1,8 @@
 name: Pipeline
 
+permissions:
+  contents: read
+
 # Scheduled production refresh. Elhub publishes a month's data after the month ends,
 # so once a month is enough. Also startable by hand.
 #
