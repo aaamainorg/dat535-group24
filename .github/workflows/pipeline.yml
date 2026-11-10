@@ -21,7 +21,7 @@ on:
     - cron: "0 6 5 * *"      # active: monthly, the 5th at 06:00 UTC (last month's Elhub data is ready)
 
 concurrency:
-  group: dat535-prod
+  group: norgespris-prod
   cancel-in-progress: false
 
 jobs:
@@ -44,7 +44,7 @@ jobs:
 
       - name: Resolve output directory
         id: output-dir
-        run: echo "dir=$HOME/dat535-data/prod" >> "$GITHUB_OUTPUT"
+        run: echo "dir=$HOME/norgespris-data/prod" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python and Java
         run: bash scripts/setup_env.sh
