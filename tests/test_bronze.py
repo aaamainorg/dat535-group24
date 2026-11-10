@@ -67,6 +67,23 @@ def test_same_file_twice_is_skipped(landing):
     assert second["ingested"] == 0 and second["skipped_duplicate"] == 1
 
 
+def test_reverted_duplicate_uses_latest_manifest_entry(landing):
+    source = landing / "timeseries.json"
+    state = {"run_id": "run-a", "manifest": [],
+             "counts": {"ingested": 0, "skipped_duplicate": 0}}
+
+    for run_id, station_id in (("run-a", "SN1"), ("run-b", "SN2"), ("run-a-again", "SN1")):
+        state["run_id"] = run_id
+        source.write_text(json.dumps({"data": [{"sourceId": f"{station_id}:0"}]}), encoding="utf-8")
+        bp.ingest_file(state, str(source), "met", "frost_timeseries", "snapshot", "test",
+                       "frost_timeseries.json")
+
+    first, _, reverted = state["manifest"]
+    assert reverted["status"] == "skipped_duplicate"
+    assert reverted["bronze_path"] == first["bronze_path"]
+    assert bp.frost_station_ids(state) == ["SN1"]
+
+
 def test_changed_header_is_flagged_but_kept(landing):
     (landing / "a.csv").write_text("A;B\n1;2\n", encoding="utf-8")
     bp.run_bronze()

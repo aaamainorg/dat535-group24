@@ -271,6 +271,7 @@ def ingest_file(state, src_path, source, dataset, period, origin, original_filen
            "size_bytes": os.path.getsize(src_path), "sha256": checksum, "header": header}
 
     if any(r["sha256"] == checksum for r in earlier):           # exact same content seen before?
+        row["bronze_path"] = next(r["bronze_path"] for r in reversed(earlier) if r["sha256"] == checksum)
         row["status"] = "skipped_duplicate"                     # yes -> do not store it again
         state["counts"]["skipped_duplicate"] += 1
         logger.info(f"  skip (already ingested): {dataset} {period} {original_filename}")
@@ -342,7 +343,8 @@ def download_and_ingest(state, cfg, url, period, filename):
 def frost_station_ids(state):
     """Station ids that have daily mean temperature, from the newest frost_timeseries file in Bronze."""
     rows = [r for r in state["manifest"]                         # stored availableTimeSeries files
-            if r["dataset"] == "frost_timeseries" and r["status"] == "ingested"]
+            if r["dataset"] == "frost_timeseries"
+            and r["status"] in ("ingested", "skipped_duplicate") and r.get("bronze_path")]
     if not rows:                                                 # step 2 did not succeed (yet)
         return []
     path = os.path.join(BRONZE_DIR, rows[-1]["bronze_path"])     # newest version
