@@ -1,0 +1,64 @@
+name: Norgespris - Dev Pipeline
+
+permissions:
+  contents: read
+
+# Runs automatically on every push to the dev branch, and by hand
+# (Actions tab -> "DAT535 - Dev Pipeline" -> Run workflow).
+# No pull_request trigger on purpose: the runner is your own machine, and in a public
+# repo anyone could open a pull request from a fork and run their code on it.
+# Writes only to ~/norgespris-data/dev, so a broken run never touches prod data.
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+# Never run two dev pipelines at the same time (they would write to the same folder).
+concurrency:
+  group: norgespris-dev
+  cancel-in-progress: false
+
+jobs:
+  run-dev:
+    name: Run Dev Pipeline
+    runs-on: self-hosted                 # your own machine with a registered GitHub runner
+    environment: dev
+    env:
+      NORGESPRIS_ENV: dev
+      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}   # required: repository secret (the .env file is not in git)
+      # Period to fetch: repository variables (Settings -> Secrets and variables -> Actions -> Variables),
+      # falling back to the same defaults as .env.example. Empty end month = last complete month.
+      NORGESPRIS_DEV_START_MONTH: ${{ vars.NORGESPRIS_DEV_START_MONTH || '2026-10' }}
+      NORGESPRIS_DEV_END_MONTH: ${{ vars.NORGESPRIS_DEV_END_MONTH || '2026-10' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve output directory
+        id: output-dir
+        # Persistent folder in your home directory (outside the checkout), so data survives between runs
+        run: echo "dir=$HOME/norgespris-data/dev" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python and Java
+        run: bash scripts/setup_env.sh
+
+      - name: Unit tests
+        run: pytest -q tests/
+
+      - name: Run pipeline (all stages)
+        env:
+          NORGESPRIS_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
+        run: |
+          mkdir -p "$NORGESPRIS_OUTPUT_DIR"
+          echo "=== Running Dev Pipeline ==="
+          python run_pipeline.py all
+
+      - name: Upload Dev manifest
+        if: always()                     # also when the run failed, so you can see why
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-manifest-${{ github.run_number }}
+          path: ${{ steps.output-dir.outputs.dir }}/bronze/_manifest.csv
+          retention-days: 7
+          if-no-files-found: ignore
