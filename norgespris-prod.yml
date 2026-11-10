@@ -1,4 +1,4 @@
-name: DAT535 - Production Pipeline
+name: Norgespris - Production Pipeline
 
 # Runs when code reaches main (after a reviewed pull request dev -> main), or by hand.
 # Uses the "main" environment: if it has required reviewers, the run waits for an approval click.
@@ -14,9 +14,9 @@ on:
         type: choice
         options: [all, bronze]
 
-# Prod runs (this file and pipeline.yml) never overlap: they share ~/dat535-data/prod.
+# Prod runs (this file and pipeline.yml) never overlap: they share ~/norgespris-data/prod.
 concurrency:
-  group: dat535-prod
+  group: norgespris-prod
   cancel-in-progress: false
 
 jobs:
@@ -25,8 +25,12 @@ jobs:
     runs-on: self-hosted
     environment: main
     env:
-      DAT535_ENV: prod
-      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}
+      NORGESPRIS_ENV: prod
+      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}   # required: repository secret (the .env file is not in git)
+      # Period to fetch: repository variables (Settings -> Secrets and variables -> Actions -> Variables),
+      # falling back to the same defaults as .env.example. Empty end month = last complete month.
+      NORGESPRIS_PROD_START_MONTH: ${{ vars.NORGESPRIS_PROD_START_MONTH || '2024-01' }}
+      NORGESPRIS_PROD_END_MONTH: ${{ vars.NORGESPRIS_PROD_END_MONTH || '' }}
 
     steps:
       - name: Checkout code
@@ -34,7 +38,7 @@ jobs:
 
       - name: Resolve output directory
         id: output-dir
-        run: echo "dir=$HOME/dat535-data/prod" >> "$GITHUB_OUTPUT"
+        run: echo "dir=$HOME/norgespris-data/prod" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python and Java
         run: bash scripts/setup_env.sh
@@ -44,9 +48,9 @@ jobs:
 
       - name: Run Production Pipeline
         env:
-          DAT535_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
+          NORGESPRIS_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
         run: |
-          mkdir -p "$DAT535_OUTPUT_DIR"
+          mkdir -p "$NORGESPRIS_OUTPUT_DIR"
           STAGE="${{ github.event.inputs.stage || 'all' }}"
           echo "=== Running Production Pipeline ($STAGE) ==="
           python run_pipeline.py "$STAGE"
@@ -59,7 +63,6 @@ jobs:
           path: ${{ steps.output-dir.outputs.dir }}/bronze/_manifest.csv
           retention-days: 30
           if-no-files-found: ignore
-          
 
       - name: Write pipeline summary
         if: always()

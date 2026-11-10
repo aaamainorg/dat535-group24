@@ -9,8 +9,8 @@ started (1 October 2025), taking temperature into account – and where is the c
 |---|---|---|
 | Elhub Energy Data API | Hourly consumption per municipality and consumption group; Norgespris consumption | API CSV export, last ~3 years per file (open) |
 | SSB table 07459 | Population per municipality, 1 January each year | PxWebApi v2 (open) |
-| MET Seklima | Daily mean temperature per weather station | Manual CSV export |
-| MET Frost API (optional) | Weather station → municipality | API (free client ID) |
+| MET Frost API | Weather stations with municipality, and their daily mean temperature | API (free client ID, in `.env`) |
+| MET Seklima (fallback) | Daily mean temperature per weather station | Manual CSV export, only if Frost is down |
 
 ## Status
 
@@ -25,6 +25,7 @@ started (1 October 2025), taking temperature into account – and where is the c
 ```text
 .
 ├── README.md
+├── .env.example                           # template for .env (credentials) - copy to .env, never commit .env
 ├── requirements.txt                       # Python packages
 ├── run_pipeline.py                        # one entry point: python run_pipeline.py bronze | all
 ├── bronze_pipeline.py                     # Bronze ingestion (generated from notebook 01, sections 3.1-3.9)
@@ -32,9 +33,13 @@ started (1 October 2025), taking temperature into account – and where is the c
 │   └── 01_scope_dataset_bronze.ipynb      # sections 1-3 of the project definition, every line explained
 ├── tests/
 │   └── test_bronze.py                     # pytest, no internet or Spark needed
+├── scripts/
+│   ├── setup_env.sh                       # prepares Python venv + Java (used by every workflow)
+│   └── manifest_summary.py                # writes the Bronze run table on the GitHub Actions run page
 └── .github/workflows/
-    ├── dat535-dev.yml                     # push to dev  -> tests + pipeline
-    └── dat535-prod.yml                    # push to main / monthly / manual -> tests + pipeline (full period)
+    ├── dat535-dev.yml                     # push to dev / manual       -> tests + pipeline into ~/dat535-data/dev
+    ├── dat535-prod.yml                    # push to main / manual      -> tests + pipeline into ~/dat535-data/prod (approval)
+    └── pipeline.yml                       # monthly schedule / manual  -> pipeline into ~/dat535-data/prod
 ```
 
 Data is **not** stored in git. It lives on the server:
@@ -47,35 +52,76 @@ Data is **not** stored in git. It lives on the server:
     └── <source>/<dataset>/<period>/<run_id>__<file>
 ```
 
-## Setup (once, on the course server)
+## Setup: GitHub Actions runner on your own machine (once)
 
-1. **Spark and Python environment.** The workflows expect `~/spark-env` (Python venv), `/opt/spark` and Java 8
-   at `/usr/lib/jvm/java-8-openjdk-amd64` – the same setup as in the course labs. If `~/spark-env` is missing:
+All three workflows use `runs-on: self-hosted`, so they run on **your computer** through a GitHub runner.
+Data goes to `~/dat535-data/dev` and `~/dat535-data/prod` on that computer – the same folders the notebook uses.
+
+1. **Python and Java on the machine.**
+   - Python 3.9+ (`python3 --version`)
+   - Java 17+ for PySpark 4 (`java -version`). macOS: `brew install openjdk@17`, then follow brew's message to link it
+     (`sudo ln -sfn $(brew --prefix)/opt/openjdk@17/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk-17.jdk`).
+   - Check that everything works: `bash scripts/setup_env.sh` – it creates `~/spark-env`, installs `requirements.txt`
+     and prints the Python, PySpark and Java versions. The workflows run the same script.
+
+2. **Register the runner.** On GitHub: repo → *Settings → Actions → Runners → New self-hosted runner*.
+   Choose your OS (macOS, ARM64 for Apple Silicon / x64 for Intel) and run the commands GitHub shows, e.g.:
    ```bash
-   python3 -m venv ~/spark-env
-   source ~/spark-env/bin/activate
-   pip install -r requirements.txt
+   mkdir ~/actions-runner && cd ~/actions-runner
+   # download + extract: copy the exact curl/tar lines from the GitHub page
+   ./config.sh --url https://github.com/aaamainorg/dat535-group24 --token <TOKEN FROM THE PAGE>
    ```
-   If the paths differ on your server, change `SPARK_HOME` / `JAVA_HOME` in both workflow files.
-   Version check: PySpark 4.x needs Java 17+, PySpark 3.5 works with Java 8. Keep the `pyspark` version in
-   `~/spark-env` the same as the Spark in `/opt/spark` (`pip install "pyspark==<that version>"`).
+3. **Start the runner.**
+   - Simplest: `./run.sh` in a terminal. The runner is online while that terminal is open.
+   - Always on in the background: `./svc.sh install && ./svc.sh start` (macOS: no `sudo`).
+     A background service does not read your shell profile – if a run cannot find Java, add a line
+     `JAVA_HOME=/path/to/java` (output of `/usr/libexec/java_home` on macOS) to `~/actions-runner/.env` and restart the service.
 
-2. **Self-hosted GitHub runner.** Repo → *Settings → Actions → Runners → New self-hosted runner* (Linux x64),
-   run the commands GitHub shows on the server, then `sudo ./svc.sh install && sudo ./svc.sh start`.
-   The runner needs internet access to `api.elhub.no`, `data.elhub.no`, `data.ssb.no` and `frost.met.no`.
+4. **GitHub environments.** Repo → *Settings → Environments*: create `dev` (no rules) and `main`
+   (add *Required reviewers* = group members). Prod deployments then wait for an approval click.
+   (Required reviewers are free for public repos; for private repos they need a paid plan – then leave the rule out.)
 
-3. **GitHub environments.** Repo → *Settings → Environments*:
-   - `dev` – no protection rules.
-   - `main` – add *Required reviewers* (group members). Prod runs then wait for an approval click,
-     **including the monthly scheduled run**.
+5. **Frost client ID (required).** Free at <https://frost.met.no/auth/requestCredentials.html>.
+   - **Locally (notebook / terminal):** put it in `.env` in the repo root – see *Credentials* below.
+   - **GitHub Actions:** add it as repository secret `FROST_CLIENT_ID` (*Settings → Secrets and variables → Actions*).
 
-4. **Frost client ID (optional, recommended).** Register for free at <https://frost.met.no/auth/requestCredentials.html>
-   and add the client ID as repository secret `FROST_CLIENT_ID` (*Settings → Secrets and variables → Actions*).
-   Without it the station → municipality download is skipped.
+6. **Manual files (only as fallback).** Any dataset can be fed by hand via `~/dat535-data/<dev|prod>/landing/<source>/<dataset>/`,
+   e.g. a Seklima export in `landing/met/seklima_daily_mean_temperature/` if Frost is down.
 
-5. **Manual files.** Export Seklima (all stations, *Middeltemperatur (døgn)*, from 2023-11-01, CSV) and put the file(s) in
-   `~/dat535-data/dev/landing/met/seklima_daily_mean_temperature/` (and the same under `prod/`).
-   Several files are fine, e.g. one per year.
+**Security:** a self-hosted runner executes whatever the workflow says on your computer. That is why the workflows
+have no `pull_request` trigger – keep it that way while the repo is public.
+
+**Laptop asleep?** A scheduled run (`pipeline.yml`) only starts when the runner is online. If it was missed,
+start it by hand: *Actions → Pipeline → Run workflow*.
+
+### Which workflow does what
+
+| Workflow | Trigger | Environment | Data folder |
+|---|---|---|---|
+| `dat535-dev.yml` | push to `dev`, manual | `dev` | `~/dat535-data/dev` |
+| `dat535-prod.yml` | push to `main` (after PR), manual with stage choice | `main` (approval) | `~/dat535-data/prod` |
+| `pipeline.yml` | monthly (5th, 06:00 UTC), manual | – | `~/dat535-data/prod` |
+
+Each run shows the Bronze manifest as a table on the run page (prod) and uploads `_manifest.csv` as an artifact.
+Prod runs never overlap (`concurrency` group), because they write to the same folder.
+
+## Credentials and settings (`.env`)
+
+```bash
+cp .env.example .env      # once, in the repo root
+# then edit .env:
+# FROST_CLIENT_ID=<your client id>
+# FROST_CLIENT_SECRET=<your client secret>
+```
+
+- `.env` is in `.gitignore`: **never commit it** and never paste the values into a notebook or a chat. `.env.example` (with placeholders) is committed so everyone knows which keys are needed.
+- The pipeline reads `.env` from the repo root (also when the notebook runs from `notebooks/`). Values already set in the environment win, so GitHub secrets override `.env`.
+- Frost uses **only the client ID** (as user name, empty password) for open data. The secret is for OAuth2/restricted data; we keep it in `.env` but do not send it.
+- **Period:** `.env` also holds which months of Frost data to fetch – `NORGESPRIS_DEV_START_MONTH` / `_END_MONTH` and
+  `NORGESPRIS_PROD_START_MONTH` / `_END_MONTH` (format `YYYY-MM`, empty end = last complete month). The pipeline uses the
+  pair that matches `NORGESPRIS_ENV`. In GitHub Actions set them as repository **variables** (not secrets); if you don't,
+  the workflows use the same defaults as `.env.example`.
+- If a value leaks (e.g. committed by mistake): create a new client at frost.met.no and delete the old one – removing the file from git is not enough.
 
 ## Running
 
@@ -83,7 +129,7 @@ Data is **not** stored in git. It lives on the server:
 source ~/spark-env/bin/activate
 
 python run_pipeline.py bronze            # dev by default -> ~/dat535-data/dev
-DAT535_ENV=prod DAT535_OUTPUT_DIR=~/dat535-data/prod python run_pipeline.py bronze   # by hand in prod
+NORGESPRIS_ENV=prod NORGESPRIS_OUTPUT_DIR=~/dat535-data/prod python run_pipeline.py bronze   # by hand in prod
 
 pytest -q tests/                         # unit tests
 jupyter notebook notebooks/              # the notebooks
@@ -109,4 +155,4 @@ When you change ingestion logic, change the notebook cell **and** paste it into 
 
 ## Licences and credits
 
-Elhub open data (NLOD) · Statistics Norway, table 07459 (CC BY 4.0) · Norwegian Meteorological Institute, Seklima/Frost (CC BY 4.0).
+Elhub open data (NLOD) · Statistics Norway, table 07459 (CC BY 4.0) · Norwegian Meteorological Institute, Frost/Seklima (CC BY 4.0).
