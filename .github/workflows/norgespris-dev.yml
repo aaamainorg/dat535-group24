@@ -3,17 +3,18 @@ name: Norgespris - Dev Pipeline
 permissions:
   contents: read
 
-# Runs automatically on every push to the dev branch, and by hand
-# (Actions tab -> "DAT535 - Dev Pipeline" -> Run workflow).
+# Runs automatically on every push to the branch dev_branch, and by hand
+# (Actions tab -> "Norgespris - Dev Pipeline" -> Run workflow).
 # No pull_request trigger on purpose: the runner is your own machine, and in a public
 # repo anyone could open a pull request from a fork and run their code on it.
-# Writes only to ~/norgespris-data/dev, so a broken run never touches prod data.
+# Writes only to /tmp/norgespris-landing/dev and the database norgespris_dev,
+# so a broken run never touches prod data.
 on:
   push:
-    branches: [dev]
+    branches: [dev_branch]
   workflow_dispatch:
 
-# Never run two dev pipelines at the same time (they would write to the same folder).
+# Never run two dev pipelines at the same time (they would write to the same folder and database).
 concurrency:
   group: norgespris-dev
   cancel-in-progress: false
@@ -24,21 +25,28 @@ jobs:
     runs-on: self-hosted                 # your own machine with a registered GitHub runner
     environment: dev
     env:
-      NORGESPRIS_ENV: dev
-      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}   # required: repository secret (the .env file is not in git)
+      NORGESPRIS_ENV: dev                # -> landing /tmp/norgespris-landing/dev, database norgespris_dev
+      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}   # required: secret (the .env file is not in git)
       # Period to fetch: repository variables (Settings -> Secrets and variables -> Actions -> Variables),
-      # falling back to the same defaults as .env.example. Empty end month = last complete month.
+      # falling back to the values below. Empty end month = last complete month.
       NORGESPRIS_DEV_START_MONTH: ${{ vars.NORGESPRIS_DEV_START_MONTH || '2026-10' }}
       NORGESPRIS_DEV_END_MONTH: ${{ vars.NORGESPRIS_DEV_END_MONTH || '2026-10' }}
+      # PostgreSQL on the runner machine: password = secret, the rest variables with defaults.
+      NORGESPRIS_PG_PASSWORD: ${{ secrets.NORGESPRIS_PG_PASSWORD }}
+      NORGESPRIS_PG_HOST: ${{ vars.NORGESPRIS_PG_HOST || 'localhost' }}
+      NORGESPRIS_PG_PORT: ${{ vars.NORGESPRIS_PG_PORT || '5432' }}
+      NORGESPRIS_PG_USER: ${{ vars.NORGESPRIS_PG_USER || 'norgespris' }}
+      # Spark on a Mac runner service: bind to localhost (avoids "Can't assign requested address").
+      SPARK_LOCAL_IP: 127.0.0.1
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Resolve output directory
-        id: output-dir
-        # Persistent folder in your home directory (outside the checkout), so data survives between runs
-        run: echo "dir=$HOME/norgespris-data/dev" >> "$GITHUB_OUTPUT"
+      - name: Resolve landing directory
+        id: landing-dir
+        # Same folder the code uses: NORGESPRIS_LANDING_ROOT (default /tmp/norgespris-landing) + /dev
+        run: echo "dir=${NORGESPRIS_LANDING_ROOT:-/tmp/norgespris-landing}/dev" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python and Java
         run: bash scripts/setup_env.sh
@@ -47,11 +55,8 @@ jobs:
         run: pytest -q tests/
 
       - name: Run pipeline (all stages)
-        env:
-          NORGESPRIS_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
         run: |
-          mkdir -p "$NORGESPRIS_OUTPUT_DIR"
-          echo "=== Running Dev Pipeline ==="
+          echo "=== Running Dev Pipeline: sources -> landing -> PostgreSQL bronze ==="
           python run_pipeline.py all
 
       - name: Upload Dev manifest
@@ -59,6 +64,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dev-manifest-${{ github.run_number }}
-          path: ${{ steps.output-dir.outputs.dir }}/bronze/_manifest.csv
+          path: ${{ steps.landing-dir.outputs.dir }}/_manifest.csv
           retention-days: 7
           if-no-files-found: ignore

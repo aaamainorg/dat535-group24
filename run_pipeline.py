@@ -6,8 +6,9 @@ DAT535 Group 24 - pipeline orchestrator
 One entry point for every layer, used both on the server and by GitHub Actions.
 
 Usage:
-    python run_pipeline.py bronze      # ingest raw files (Bronze)
-    python run_pipeline.py all         # every layer that exists so far, in order
+    python run_pipeline.py bronze      # sources -> raw files in the landing folder (/tmp/norgespris-landing/<env>)
+    python run_pipeline.py postgres    # landing files -> PostgreSQL schema bronze (the Bronze layer)
+    python run_pipeline.py all         # every stage, in order: bronze -> postgres
     python run_pipeline.py --help
 
 Silver and Gold are added here as new stages when they are built
@@ -25,14 +26,21 @@ logger = logging.getLogger("run_pipeline")
 
 
 def run_bronze():
-    """Bronze: download/copy raw source files and update the manifest."""
+    """Download/copy raw source files into the landing folder and update the manifest."""
     from bronze_pipeline import run_bronze as bronze   # imported here so --help works without side effects
     return bronze()
 
 
+def run_postgres():
+    """Bronze: load the newest landing files into PostgreSQL tables (schema bronze)."""
+    from bronze_to_postgres import run_bronze_to_postgres   # imports Spark only when this stage runs
+    return run_bronze_to_postgres()
+
+
 # Stages in the order they must run. Add "silver" and "gold" here later.
 STAGES = {
-    "bronze": run_bronze,
+    "bronze": run_bronze,       # 1. sources -> raw files in /tmp/norgespris-landing/<env>
+    "postgres": run_postgres,   # 2. landing files -> PostgreSQL norgespris_<env>, schema bronze
 }
 
 

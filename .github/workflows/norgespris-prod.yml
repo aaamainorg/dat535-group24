@@ -3,7 +3,7 @@ name: Norgespris - Production Pipeline
 permissions:
   contents: read
 
-# Runs when code reaches main (after a reviewed pull request dev -> main), or by hand.
+# Runs when code reaches main (after a reviewed pull request dev_branch -> main), or by hand.
 # Uses the "main" environment: if it has required reviewers, the run waits for an approval click.
 on:
   push:
@@ -15,9 +15,10 @@ on:
         required: true
         default: all
         type: choice
-        options: [all, bronze]
+        options: [all, bronze, postgres]
 
-# Prod runs (this file and pipeline.yml) never overlap: they share ~/norgespris-data/prod.
+# Prod runs (this file and pipeline.yml) never overlap: they share
+# /tmp/norgespris-landing/prod and the database norgespris_prod.
 concurrency:
   group: norgespris-prod
   cancel-in-progress: false
@@ -28,20 +29,26 @@ jobs:
     runs-on: self-hosted
     environment: main
     env:
-      NORGESPRIS_ENV: prod
-      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}   # required: repository secret (the .env file is not in git)
-      # Period to fetch: repository variables (Settings -> Secrets and variables -> Actions -> Variables),
-      # falling back to the same defaults as .env.example. Empty end month = last complete month.
+      NORGESPRIS_ENV: prod               # -> landing /tmp/norgespris-landing/prod, database norgespris_prod
+      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}   # required: secret (the .env file is not in git)
+      # Period to fetch: repository variables, falling back to the values below.
+      # Keep these the same as in pipeline.yml - both write to the same prod data.
       NORGESPRIS_PROD_START_MONTH: ${{ vars.NORGESPRIS_PROD_START_MONTH || '2024-01' }}
       NORGESPRIS_PROD_END_MONTH: ${{ vars.NORGESPRIS_PROD_END_MONTH || '' }}
+      # PostgreSQL on the runner machine: password = secret, the rest variables with defaults.
+      NORGESPRIS_PG_PASSWORD: ${{ secrets.NORGESPRIS_PG_PASSWORD }}
+      NORGESPRIS_PG_HOST: ${{ vars.NORGESPRIS_PG_HOST || 'localhost' }}
+      NORGESPRIS_PG_PORT: ${{ vars.NORGESPRIS_PG_PORT || '5432' }}
+      NORGESPRIS_PG_USER: ${{ vars.NORGESPRIS_PG_USER || 'norgespris' }}
+      SPARK_LOCAL_IP: 127.0.0.1          # Spark on a Mac runner service: bind to localhost
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Resolve output directory
-        id: output-dir
-        run: echo "dir=$HOME/norgespris-data/prod" >> "$GITHUB_OUTPUT"
+      - name: Resolve landing directory
+        id: landing-dir
+        run: echo "dir=${NORGESPRIS_LANDING_ROOT:-/tmp/norgespris-landing}/prod" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python and Java
         run: bash scripts/setup_env.sh
@@ -50,10 +57,7 @@ jobs:
         run: pytest -q tests/
 
       - name: Run Production Pipeline
-        env:
-          NORGESPRIS_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
         run: |
-          mkdir -p "$NORGESPRIS_OUTPUT_DIR"
           STAGE="${{ github.event.inputs.stage || 'all' }}"
           echo "=== Running Production Pipeline ($STAGE) ==="
           python run_pipeline.py "$STAGE"
@@ -63,14 +67,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: prod-manifest-${{ github.run_number }}
-          path: ${{ steps.output-dir.outputs.dir }}/bronze/_manifest.csv
+          path: ${{ steps.landing-dir.outputs.dir }}/_manifest.csv
           retention-days: 30
           if-no-files-found: ignore
 
       - name: Write pipeline summary
         if: always()
         run: |
-          MANIFEST="${{ steps.output-dir.outputs.dir }}/bronze/_manifest.csv"
+          MANIFEST="${{ steps.landing-dir.outputs.dir }}/_manifest.csv"
           echo "## Production Pipeline Run" >> "$GITHUB_STEP_SUMMARY"
           echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----|-------|" >> "$GITHUB_STEP_SUMMARY"

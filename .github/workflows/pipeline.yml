@@ -10,8 +10,10 @@ permissions:
 # online at that moment. If the laptop was asleep, the run waits in the queue until the
 # runner comes online (or is dropped after 24 h) - then just start it by hand.
 #
-# Unlike dat535-prod.yml this has no approval step: it only re-runs code that is already
-# reviewed and merged to main, and a scheduled run nobody approves would never start.
+# This job uses the "main" environment (so it can read secrets stored there).
+# If "main" has required reviewers, every scheduled run waits for an approval click -
+# remove the "environment: main" line if the secrets are repository secrets and you
+# want the monthly run to start on its own.
 on:
   workflow_dispatch:
   schedule:
@@ -28,13 +30,19 @@ jobs:
   run-pipeline:
     name: Run PySpark Pipeline (scheduled, prod)
     runs-on: self-hosted
+    environment: main
     env:
-      NORGESPRIS_ENV: prod
-      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}   # required: repository secret (the .env file is not in git)
-      # Period to fetch: repository variables (Settings -> Secrets and variables -> Actions -> Variables),
-      # falling back to the same defaults as .env.example. Empty end month = last complete month.
-      NORGESPRIS_PROD_START_MONTH: ${{ vars.NORGESPRIS_PROD_START_MONTH || '2023-11' }}
+      NORGESPRIS_ENV: prod               # -> landing /tmp/norgespris-landing/prod, database norgespris_prod
+      FROST_CLIENT_ID: ${{ secrets.FROST_CLIENT_ID }}   # required: secret (the .env file is not in git)
+      # Same period as norgespris-prod.yml - both write to the same prod data.
+      NORGESPRIS_PROD_START_MONTH: ${{ vars.NORGESPRIS_PROD_START_MONTH || '2024-01' }}
       NORGESPRIS_PROD_END_MONTH: ${{ vars.NORGESPRIS_PROD_END_MONTH || '' }}
+      # PostgreSQL on the runner machine: password = secret, the rest variables with defaults.
+      NORGESPRIS_PG_PASSWORD: ${{ secrets.NORGESPRIS_PG_PASSWORD }}
+      NORGESPRIS_PG_HOST: ${{ vars.NORGESPRIS_PG_HOST || 'localhost' }}
+      NORGESPRIS_PG_PORT: ${{ vars.NORGESPRIS_PG_PORT || '5432' }}
+      NORGESPRIS_PG_USER: ${{ vars.NORGESPRIS_PG_USER || 'norgespris' }}
+      SPARK_LOCAL_IP: 127.0.0.1          # Spark on a Mac runner service: bind to localhost
 
     steps:
       - name: Checkout code
@@ -42,19 +50,16 @@ jobs:
         with:
           ref: main                      # always the reviewed production code
 
-      - name: Resolve output directory
-        id: output-dir
-        run: echo "dir=$HOME/norgespris-data/prod" >> "$GITHUB_OUTPUT"
+      - name: Resolve landing directory
+        id: landing-dir
+        run: echo "dir=${NORGESPRIS_LANDING_ROOT:-/tmp/norgespris-landing}/prod" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python and Java
         run: bash scripts/setup_env.sh
 
       - name: Run Pipeline
-        env:
-          NORGESPRIS_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
         run: |
-          mkdir -p "$NORGESPRIS_OUTPUT_DIR"
-          echo "=== Starting Data Pipeline Execution ==="
+          echo "=== Starting Data Pipeline Execution: sources -> landing -> PostgreSQL bronze ==="
           python run_pipeline.py all
           echo ""
           echo "=== All Pipelines Completed Successfully ==="
@@ -62,7 +67,7 @@ jobs:
       - name: Write pipeline summary
         if: always()
         run: |
-          MANIFEST="${{ steps.output-dir.outputs.dir }}/bronze/_manifest.csv"
+          MANIFEST="${{ steps.landing-dir.outputs.dir }}/_manifest.csv"
           echo "## Scheduled Pipeline Run #${{ github.run_number }}" >> "$GITHUB_STEP_SUMMARY"
           if [ -f "$MANIFEST" ]; then
             python scripts/manifest_summary.py "$MANIFEST" >> "$GITHUB_STEP_SUMMARY"

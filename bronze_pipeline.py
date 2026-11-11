@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DAT535 Group 24 - Bronze layer (ingest and preserve)
-=====================================================
+DAT535 Group 24 - ingest raw files into the landing folder
+==========================================================
 
 GENERATED from the code cells in sections 3.1-3.9 of
-notebooks/01_scope_dataset_bronze.ipynb. The notebook explains every line;
+notebooks/01_bronze.ipynb. The notebook explains every line;
 this file is what GitHub Actions runs. If you change the logic, change the
 notebook cell and copy it here, so the two stay identical.
 
@@ -57,13 +57,13 @@ def load_env_file(candidates=(".env", os.path.join("..", ".env"))):
 
 load_env_file()                                               # run it once when the code is loaded
 
-ENV = os.environ.get("NORGESPRIS_ENV", "dev")                     # "dev" or "prod"; default dev when run by hand
-DATA_ROOT = os.environ.get("NORGESPRIS_OUTPUT_DIR",               # root folder chosen by the workflow ...
-                           os.path.expanduser(f"~/dat535-data/{ENV}"))  # ... or ~/dat535-data/dev locally
+ENV = os.environ.get("NORGESPRIS_ENV", "dev")                 # "dev" or "prod"; default dev when run by hand
 
-LANDING_DIR = os.path.join(DATA_ROOT, "landing")              # put manually exported files here
-BRONZE_DIR = os.path.join(DATA_ROOT, "bronze")                # raw files, never edited
-MANIFEST_PATH = os.path.join(BRONZE_DIR, "_manifest.csv")     # one line per file we have seen
+LANDING_ROOT = os.environ.get("NORGESPRIS_LANDING_ROOT",      # where the raw files are stored ...
+                              "/tmp/norgespris-landing")      # ... default: a folder in /tmp
+LANDING_DIR = os.path.join(LANDING_ROOT, ENV)                 # /tmp/norgespris-landing/dev or .../prod
+MANUAL_DIR = os.path.join(LANDING_DIR, "_manual")             # drop manually exported files here
+MANIFEST_PATH = os.path.join(LANDING_DIR, "_manifest.csv")    # one line per file we have seen
 
 REDOWNLOAD_RECENT_MONTHS = 2                                  # always re-fetch the newest months (MET corrects recent data)
 FROST_STATIONS_PER_REQUEST = 100                              # stations per observations request (keeps answers small)
@@ -126,7 +126,7 @@ SOURCES = [                                                                    #
 ]
 
 MANIFEST_COLUMNS = ["run_id", "env", "source", "dataset", "period", "origin",  # columns of _manifest.csv
-                    "original_filename", "bronze_path", "ingested_at_utc", "size_bytes",
+                    "original_filename", "landing_path", "ingested_at_utc", "size_bytes",
                     "sha256", "header", "schema_status", "status"]
 
 
@@ -179,7 +179,7 @@ def read_manifest():
 
 def append_manifest(row):
     """Append one row to the manifest (writes the column names if the file is new)."""
-    os.makedirs(BRONZE_DIR, exist_ok=True)                     # make sure the bronze folder exists
+    os.makedirs(LANDING_DIR, exist_ok=True)                    # make sure the landing folder exists
     is_new = not os.path.exists(MANIFEST_PATH)                 # do we need to write the column names?
     with open(MANIFEST_PATH, "a", newline="", encoding="utf-8") as f:  # "a" = append, never overwrite
         writer = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS, restval="")  # missing keys become ""
@@ -259,7 +259,7 @@ def download(url, target_path, headers=None, attempts=3):
 
 
 def ingest_file(state, src_path, source, dataset, period, origin, original_filename):
-    """Copy one file unchanged into Bronze unless an identical file is already there."""
+    """Store one file unchanged in the landing folder unless an identical file is already there."""
     checksum = content_sha256(src_path)                         # fingerprint of the content (inside a ZIP: the files)
     header = read_header(src_path)                              # column-names line, or "(json)"
     earlier = [r for r in state["manifest"]                     # earlier files of the SAME dataset ...
@@ -271,7 +271,7 @@ def ingest_file(state, src_path, source, dataset, period, origin, original_filen
            "size_bytes": os.path.getsize(src_path), "sha256": checksum, "header": header}
 
     if any(r["sha256"] == checksum for r in earlier):           # exact same content seen before?
-        row["bronze_path"] = next(r["bronze_path"] for r in reversed(earlier) if r["sha256"] == checksum)
+        row["landing_path"] = next(r["landing_path"] for r in reversed(earlier) if r["sha256"] == checksum)
         row["status"] = "skipped_duplicate"                     # yes -> do not store it again
         state["counts"]["skipped_duplicate"] += 1
         logger.info(f"  skip (already ingested): {dataset} {period} {original_filename}")
@@ -287,17 +287,17 @@ def ingest_file(state, src_path, source, dataset, period, origin, original_filen
         stored_name = original_filename
         if is_zip and not stored_name.lower().endswith(".zip"):               # give it the correct file ending
             stored_name = os.path.splitext(stored_name)[0] + ".zip"
-        target_dir = os.path.join(BRONZE_DIR, source, dataset, period)        # e.g. bronze/met/frost_observations/2025-10
+        target_dir = os.path.join(LANDING_DIR, source, dataset, period)       # e.g. <landing>/met/frost_observations/2025-10
         os.makedirs(target_dir, exist_ok=True)                                # create the folder if missing
         target = os.path.join(target_dir, f"{state['run_id']}__{stored_name}")  # run_id keeps versions apart
         shutil.copy2(src_path, target)                                        # byte-for-byte copy of the original
         if is_zip:                                                            # unpack a copy for Spark
             with zipfile.ZipFile(target) as zf:
                 zf.extractall(target[:-len(".zip")] + "_unzipped")            # <run_id>__<name>_unzipped/part-....csv
-        row["bronze_path"] = os.path.relpath(target, BRONZE_DIR)              # path relative to bronze/
+        row["landing_path"] = os.path.relpath(target, LANDING_DIR)            # path relative to the landing folder
         row["status"] = "ingested"
         state["counts"]["ingested"] += 1
-        logger.info(f"  ingested: {row['bronze_path']}")
+        logger.info(f"  ingested: {row['landing_path']}")
 
     append_manifest(row)                                        # write the line to disk right away
     state["manifest"].append(row)                               # and remember it for the rest of the run
@@ -316,7 +316,7 @@ def download_and_ingest(state, cfg, url, period, filename):
         append_manifest(dict(base_row, status=f"{level}: FROST_CLIENT_ID missing (set it in .env)"))
         logger.error(f"  {level.upper()}: {dataset} needs FROST_CLIENT_ID (in .env or as GitHub secret)")
         return
-    tmp_path = os.path.join(state["tmp_dir"], filename)          # temp file in bronze/_tmp/<run_id>/
+    tmp_path = os.path.join(state["tmp_dir"], filename)          # arrives in <landing>/_incoming/<run_id>/ first
     try:
         download(url, tmp_path, headers)                         # may raise after failed attempts
         ingest_file(state, tmp_path, source, dataset, period, url, filename)  # checks + copy + manifest
@@ -341,13 +341,13 @@ def download_and_ingest(state, cfg, url, period, filename):
 
 
 def frost_station_ids(state):
-    """Station ids that have daily mean temperature, from the newest frost_timeseries file in Bronze."""
+    """Station ids that have daily mean temperature, from the newest frost_timeseries file in landing."""
     rows = [r for r in state["manifest"]                         # stored availableTimeSeries files
             if r["dataset"] == "frost_timeseries"
-            and r["status"] in ("ingested", "skipped_duplicate") and r.get("bronze_path")]
+            and r["status"] in ("ingested", "skipped_duplicate") and r.get("landing_path")]
     if not rows:                                                 # step 2 did not succeed (yet)
         return []
-    path = os.path.join(BRONZE_DIR, rows[-1]["bronze_path"])     # newest version
+    path = os.path.join(LANDING_DIR, rows[-1]["landing_path"])     # newest version
     with open(path, encoding="utf-8") as f:
         data = json.load(f).get("data", [])                      # Frost puts the records in "data"
     return sorted({d["sourceId"].split(":")[0] for d in data})   # "SN18700:0" -> "SN18700", no duplicates
@@ -386,11 +386,11 @@ def run_bronze():
     start_time = time.time()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")  # microseconds keep rapid runs apart
     state = {"run_id": run_id,                                 # shared state for the helper functions
-             "tmp_dir": os.path.join(BRONZE_DIR, "_tmp", run_id),
+             "tmp_dir": os.path.join(LANDING_DIR, "_incoming", run_id),  # downloads arrive here first
              "manifest": read_manifest(),                      # everything ingested in earlier runs
              "counts": {"ingested": 0, "skipped_duplicate": 0, "no_data": 0, "warning": 0, "failed": 0}}
     os.makedirs(state["tmp_dir"], exist_ok=True)
-    logger.info(f"Bronze run {run_id} (env={ENV}) -> {BRONZE_DIR}")
+    logger.info(f"Landing run {run_id} (env={ENV}) -> {LANDING_DIR}")
 
     for cfg in SOURCES:                                        # one dataset at a time, in registry order
         source, dataset, mode = cfg["source"], cfg["dataset"], cfg["mode"]
@@ -406,14 +406,14 @@ def run_bronze():
                 for url, month, filename in frost_observation_requests(state, cfg):
                     download_and_ingest(state, cfg, url, month, filename)
 
-        landing = os.path.join(LANDING_DIR, source, dataset)   # manual files for this dataset
-        os.makedirs(landing, exist_ok=True)                    # create it so you can see where files go
-        for name in sorted(os.listdir(landing)):               # every file in the landing folder
+        manual = os.path.join(MANUAL_DIR, source, dataset)     # manual files for this dataset
+        os.makedirs(manual, exist_ok=True)                     # create it so you can see where files go
+        for name in sorted(os.listdir(manual)):                # every file in the manual folder
             if name.lower().endswith((".csv", ".json", ".zip")):  # only data files
-                ingest_file(state, os.path.join(landing, name), source, dataset,
-                            "manual", f"landing/{source}/{dataset}", name)  # duplicates skipped by checksum
+                ingest_file(state, os.path.join(manual, name), source, dataset,
+                            "manual", f"_manual/{source}/{dataset}", name)  # duplicates skipped by checksum
 
-    shutil.rmtree(state["tmp_dir"], ignore_errors=True)        # remove the temp folder
+    shutil.rmtree(state["tmp_dir"], ignore_errors=True)        # empty the incoming folder of this run
     elapsed = time.time() - start_time
     logger.info(f"Bronze done in {elapsed:.1f}s: {state['counts']}")
     status = "success" if state["counts"]["failed"] == 0 else "failed"  # a failed REQUIRED source -> failed run

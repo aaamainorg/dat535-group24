@@ -33,10 +33,10 @@ FROST_OBS = {"source": "met", "dataset": "frost_observations", "mode": "frost_ob
 def landing(tmp_path, monkeypatch):
     """Point all folders to a temp dir and use one manual-only source."""
     monkeypatch.setattr(bp, "LANDING_DIR", str(tmp_path / "landing"))
-    monkeypatch.setattr(bp, "BRONZE_DIR", str(tmp_path / "bronze"))
-    monkeypatch.setattr(bp, "MANIFEST_PATH", str(tmp_path / "bronze" / "_manifest.csv"))
+    monkeypatch.setattr(bp, "MANUAL_DIR", str(tmp_path / "landing" / "_manual"))
+    monkeypatch.setattr(bp, "MANIFEST_PATH", str(tmp_path / "landing" / "_manifest.csv"))
     monkeypatch.setattr(bp, "SOURCES", [MANUAL])
-    folder = tmp_path / "landing" / "met" / "test_temp"
+    folder = tmp_path / "landing" / "_manual" / "met" / "test_temp"
     folder.mkdir(parents=True)
     return folder
 
@@ -56,7 +56,7 @@ def test_file_is_stored_unchanged_with_metadata(landing):
     assert result["status"] == "success" and result["ingested"] == 1
     assert row["status"] == "ingested" and row["schema_status"] == "first_file"
     assert row["header"] == "Navn;Stasjon;Tid;Temp"                       # BOM/CRLF removed in metadata only
-    stored = os.path.join(bp.BRONZE_DIR, row["bronze_path"])
+    stored = os.path.join(bp.LANDING_DIR, row["landing_path"])
     assert bp.sha256_of(stored) == bp.sha256_of(landing / "a.csv")        # byte-identical copy
 
 
@@ -80,7 +80,7 @@ def test_reverted_duplicate_uses_latest_manifest_entry(landing):
 
     first, _, reverted = state["manifest"]
     assert reverted["status"] == "skipped_duplicate"
-    assert reverted["bronze_path"] == first["bronze_path"]
+    assert reverted["landing_path"] == first["landing_path"]
     assert bp.frost_station_ids(state) == ["SN1"]
 
 
@@ -101,7 +101,7 @@ def test_zip_is_kept_unpacked_and_checksummed_by_content(landing):
     make_zip(landing / "export.zip")
     bp.run_bronze()
     row = bp.read_manifest()[0]
-    stored = os.path.join(bp.BRONZE_DIR, row["bronze_path"])
+    stored = os.path.join(bp.LANDING_DIR, row["landing_path"])
     assert stored.endswith(".zip") and row["header"] == "START_TIME,QUANTITY_KWH"
     assert os.path.exists(stored[:-4] + "_unzipped/part-00000-abc.csv")   # unpacked copy for Spark
 
@@ -166,7 +166,7 @@ def test_frost_login(monkeypatch):
     monkeypatch.delenv("FROST_CLIENT_ID", raising=False)
     assert bp.auth_headers({"auth": "frost"}) is None                     # missing
     monkeypatch.setenv("FROST_CLIENT_ID", "your-frost-client-id")
-    assert bp.auth_headers({"auth": "frost"}) is None                     # placeholder from .env.example
+    assert bp.auth_headers({"auth": "frost"}) is None                     # placeholder from env.example
     monkeypatch.setenv("FROST_CLIENT_ID", "abc")
     import base64
     token = bp.auth_headers({"auth": "frost"})["Authorization"].split()[1]
@@ -184,11 +184,11 @@ def test_missing_frost_login_fails_the_run_once(landing, monkeypatch):
 
 def write_timeseries(state, ids):
     """Put a fake availableTimeSeries file in Bronze and the manifest."""
-    path = os.path.join(bp.BRONZE_DIR, "ts.json")
-    os.makedirs(bp.BRONZE_DIR, exist_ok=True)
+    path = os.path.join(bp.LANDING_DIR, "ts.json")
+    os.makedirs(bp.LANDING_DIR, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"data": [{"sourceId": f"{i}:0"} for i in ids] + [{"sourceId": f"{ids[0]}:1"}]}, f)
-    state["manifest"].append({"dataset": "frost_timeseries", "status": "ingested", "bronze_path": "ts.json"})
+    state["manifest"].append({"dataset": "frost_timeseries", "status": "ingested", "landing_path": "ts.json"})
 
 
 def test_frost_requests_groups_months_and_skips(landing, monkeypatch):
