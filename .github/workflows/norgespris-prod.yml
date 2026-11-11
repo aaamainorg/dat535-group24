@@ -71,6 +71,9 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
+      - name: Unit tests
+        run: pytest -q tests/
+
       - name: Write pipeline summary
         if: always()
         run: |
