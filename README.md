@@ -18,7 +18,7 @@ started (1 October 2025), taking temperature into account – and where is the c
 |---|---|---|
 | Scope, dataset, landing (raw files) | ✅ done | `notebooks/01_bronze.ipynb` sections 1–4, `bronze_pipeline.py` |
 | Bronze (PostgreSQL schema `bronze`) | ✅ done | notebook 01 section 5, `bronze_to_postgres.py` |
-| Silver | ⏳ next | – |
+| Silver (PostgreSQL schema `silver`) | ✅ done | `notebooks/02_silver.ipynb`, `silver_pipeline.py` |
 | Gold + dashboard | ⏳ | – |
 
 ## Repository structure
@@ -31,11 +31,14 @@ started (1 October 2025), taking temperature into account – and where is the c
 ├── run_pipeline.py                        # one entry point: python run_pipeline.py bronze | postgres | all
 ├── bronze_pipeline.py                     # stage "bronze":   sources -> landing files (generated from notebook 01, 3.1-3.9)
 ├── bronze_to_postgres.py                  # stage "postgres": landing files -> PostgreSQL schema bronze (notebook 01, 4.1/4.2/4.5/5)
+├── silver_pipeline.py                     # stage "silver":   schema bronze -> schema silver (generated from notebook 02)
 ├── notebooks/
-│   └── 01_bronze.ipynb                    # sections 1-3 of the project definition + load into PostgreSQL, every line explained
+│   ├── 01_bronze.ipynb                    # sections 1-3 of the project definition + load into PostgreSQL, every line explained
+│   └── 02_silver.ipynb                    # section 4: Silver design + cleaning, every line explained
 ├── tests/
 │   ├── test_bronze.py                     # pytest, no internet or Spark needed
-│   └── test_postgres.py                   # pytest for the PostgreSQL settings (no database needed)
+│   ├── test_postgres.py                   # pytest for the PostgreSQL settings (no database needed)
+│   └── test_silver.py                     # pytest for every Silver cleaning function (local Spark, no database)
 ├── scripts/
 │   ├── setup_env.sh                       # prepares Python venv + Java (used by every workflow)
 │   ├── init_postgres.sql                  # one-time PostgreSQL setup: role, databases, schemas
@@ -63,7 +66,12 @@ sources (Elhub, SSB, Frost)
 PostgreSQL norgespris_<dev|prod>
 ├── bronze.<dataset>                       # BRONZE: one table per dataset, all text + _source_file, _landing_run_id, _loaded_at
 ├── bronze.manifest, bronze._load_log      # monitoring: what was ingested / loaded when
-├── silver.*                               # next notebook
+├── silver.*                               # SILVER (stage "silver"): typed, cleaned, one row per key (daily grain)
+│   ├── municipality, population_yearly
+│   ├── consumption_daily
+│   ├── weather_station, temperature_station_daily, temperature_municipality_daily
+│   ├── norgespris_price_area_daily
+│   └── rejects, quality_metrics          # rejected records (with rule id) and quality history
 └── gold.*                                 # later
 ```
 
@@ -200,11 +208,11 @@ start it by hand: *Actions → Pipeline → Run workflow*.
 
 | Workflow | Trigger | Environment | Landing folder | Database |
 |---|---|---|---|---|
-| `norgespris-dev.yml` | push to `dev`, manual | `dev` | `/tmp/norgespris-landing/dev` | `norgespris_dev` |
+| `norgespris-dev.yml` | push to `dev_branch`, manual | `dev` | `/tmp/norgespris-landing/dev` | `norgespris_dev` |
 | `norgespris-prod.yml` | push to `main` (after PR), manual with stage choice | `main` (approval) | `/tmp/norgespris-landing/prod` | `norgespris_prod` |
 | `pipeline.yml` | monthly (5th, 06:00 UTC), manual | – | `/tmp/norgespris-landing/prod` | `norgespris_prod` |
 
-Every workflow runs `python run_pipeline.py all` = stage `bronze` (sources → landing files) and then stage `postgres` (landing → `bronze` tables).
+Every workflow runs `python run_pipeline.py all` = stage `bronze` (sources → landing files), stage `postgres` (landing → `bronze` tables) and stage `silver` (`bronze` → `silver` tables).
 
 Each run shows the landing manifest as a table on the run page (prod) and uploads `_manifest.csv` as an artifact.
 Prod runs never overlap (`concurrency` group), because they write to the same folder and database.
@@ -222,7 +230,7 @@ cp env.example .env       # once, in the repo root
 - `.env` is in `.gitignore`: **never commit it** and never paste the values into a notebook or a chat. `env.example` (with placeholders) is committed so everyone knows which keys are needed.
 - The pipeline reads `.env` from the repo root (also when the notebook runs from `notebooks/`). Values already set in the environment win, so GitHub secrets override `.env`.
 - Frost uses **only the client ID** (as user name, empty password) for open data. The secret is for OAuth2/restricted data; we keep it in `.env` but do not send it.
-- **Period:** `.env` also holds which months of Frost data to fetch – `NORGESPRIS_DEV_START_MONTH` / `_END_MONTH` and
+- **Period:** `.env` also holds which months of Frost data to fetch **and which months Silver keeps** – `NORGESPRIS_DEV_START_MONTH` / `_END_MONTH` and
   `NORGESPRIS_PROD_START_MONTH` / `_END_MONTH` (format `YYYY-MM`, empty end = last complete month). The pipeline uses the
   pair that matches `NORGESPRIS_ENV`. In GitHub Actions set them as repository **variables** (not secrets); if you don't,
   the workflows use their own defaults (see the `env:` block in each workflow file).
@@ -239,6 +247,7 @@ source ~/spark-env/bin/activate
 python run_pipeline.py all               # dev by default: sources -> /tmp/norgespris-landing/dev -> norgespris_dev.bronze
 python run_pipeline.py bronze            # only download/copy raw files into the landing folder
 python run_pipeline.py postgres          # only (re)load the landing files into the bronze schema
+python run_pipeline.py silver            # only rebuild the silver schema from the bronze schema
 NORGESPRIS_ENV=prod python run_pipeline.py all   # by hand in prod (/tmp/norgespris-landing/prod, norgespris_prod)
 
 pytest -q tests/                         # unit tests
@@ -250,18 +259,18 @@ Re-running is safe: files already in the landing folder (same checksum) are skip
 ## Branches and deployment
 
 ```bash
-git checkout -b dev                      # day-to-day work
+git checkout -b dev_branch               # day-to-day work
 git add . && git commit -m "feat(bronze): ..."
-git push -u origin dev                   # -> dev workflow runs on the server
+git push -u origin dev_branch            # -> dev workflow runs on the runner
 ```
 
-Release: open a pull request `dev → main`, get it reviewed, merge → prod workflow runs after approval.
+Release: open a pull request `dev_branch → main`, get it reviewed, merge → prod workflow runs after approval.
 Check runs under the **Actions** tab; each run uploads the Bronze manifest as an artifact.
 
 ## Keeping the notebook and the script in sync
 
-`bronze_pipeline.py` contains exactly the code cells of notebook 01, sections 3.1–3.9, and `bronze_to_postgres.py`
-the cells of 4.1 (settings), 4.2/4.5 (readers) and 5.1–5.2 (loader).
+`bronze_pipeline.py` contains exactly the code cells of notebook 01, sections 3.1–3.9, `bronze_to_postgres.py`
+the cells of 4.1 (settings), 4.2/4.5 (readers) and 5.1–5.2 (loader), and `silver_pipeline.py` the cells of notebook 02, sections 2 and 4–5.1.
 When you change the logic, change the notebook cell **and** paste it into the matching `.py` file, then run `pytest`.
 
 ## Licences and credits

@@ -51,9 +51,12 @@ jobs:
       - name: Set up Python and Java
         run: bash scripts/setup_env.sh
 
+      - name: Unit tests
+        run: pytest -q tests/
+
       - name: Run pipeline (all stages)
         run: |
-          echo "=== Running Dev Pipeline: sources -> landing -> PostgreSQL bronze ==="
+          echo "=== Running Dev Pipeline: sources -> landing -> PostgreSQL bronze -> silver ==="
           python run_pipeline.py all
 
       - name: Upload Dev manifest
@@ -64,6 +67,3 @@ jobs:
           path: ${{ steps.landing-dir.outputs.dir }}/_manifest.csv
           retention-days: 7
           if-no-files-found: ignore
-
-      - name: Unit tests
-        run: pytest -q tests/

@@ -79,21 +79,47 @@ def guess_sep(dataset, default):
     header = rows.sort_values("run_id").header.iloc[-1]         # header of the newest file
     return ";" if header.count(";") > header.count(",") else ","
 
+def guess_encoding(path):
+    """'UTF-8' if the start of the file is valid UTF-8, otherwise 'ISO-8859-1' (Latin-1, e.g. SSB's API: 'å' = one byte)."""
+    if os.path.isdir(path):                                     # unpacked ZIP folder -> look at its first CSV
+        csvs = sorted(f for f in os.listdir(path) if f.lower().endswith(".csv"))
+        if not csvs:
+            return "UTF-8"
+        path = os.path.join(path, csvs[0])
+    with open(path, "rb") as f:
+        sample = f.read(65536)                                  # the first 64 KB are enough to decide
+    try:
+        sample.decode("utf-8")                                  # valid UTF-8 (plain ASCII is too) -> UTF-8
+        return "UTF-8"
+    except UnicodeDecodeError as e:
+        if e.start >= len(sample) - 3:                          # only the last character was cut by the 64 KB limit
+            return "UTF-8"
+        return "ISO-8859-1"                                     # bytes that are not UTF-8 -> Latin-1 (Norwegian letters = 1 byte)
+
 def read_bronze(cfg):
     """Read a Bronze CSV dataset with Spark, all columns as text; None if nothing to read."""
     files = newest_files(cfg["dataset"])                        # which files/folders to read
     if not files or cfg["sep"] is None:                         # nothing ingested, or JSON (Frost -> 4.5)
         return None
     sep = guess_sep(cfg["dataset"], cfg["sep"])                 # Elhub's ZIP may use another separator than our samples
-    df = (spark.read
-          .option("header", True)                               # first line = column names
-          .option("inferSchema", False)                         # keep everything as text (raw)
-          .option("sep", sep)                                   # separator for this dataset
-          .option("encoding", "UTF-8")
-          .csv(files))                                          # list of files -> one DataFrame
-    clean = [c.replace("\ufeff", "").strip() for c in df.columns]  # remove BOM from column names only
-    return df.select(*[F.col(f"`{c}`").alias(n) for c, n in zip(df.columns, clean)],  # same columns, clean names
-                     F.col("_metadata.file_path").alias("_source_file"))         # + which landing file
+    by_encoding = {}                                            # {'UTF-8': [files], 'ISO-8859-1': [files]}
+    for path in files:
+        by_encoding.setdefault(guess_encoding(path), []).append(path)
+    parts = []
+    for encoding, group in by_encoding.items():                 # one Spark read per encoding
+        df = (spark.read
+              .option("header", True)                           # first line = column names
+              .option("inferSchema", False)                     # keep everything as text (raw)
+              .option("sep", sep)                               # separator for this dataset
+              .option("encoding", encoding)                     # the encoding the files are written in
+              .csv(group))                                      # list of files -> one DataFrame
+        clean = [c.replace("\ufeff", "").strip() for c in df.columns]  # remove BOM from column names only
+        parts.append(df.select(*[F.col(f"`{c}`").alias(n) for c, n in zip(df.columns, clean)],  # same columns, clean names
+                               F.col("_metadata.file_path").alias("_source_file")))         # + which landing file
+    result = parts[0]
+    for part in parts[1:]:                                      # files with different encodings -> one DataFrame
+        result = result.unionByName(part, allowMissingColumns=True)  # columns only in some files -> NULL elsewhere
+    return result
 
 
 def read_frost(dataset):
