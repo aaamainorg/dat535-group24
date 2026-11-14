@@ -94,7 +94,7 @@ SSB_URL = ("https://data.ssb.no/api/pxwebapi/v2/tables/07459/data?lang=no"      
            "&valueCodes[Region]=*&codelist[Region]=agg_KommSummer"             # all municipalities, today's structure
            "&outputValues[Region]=aggregated"                                  # sums for merged municipalities
            "&valueCodes[ContentsCode]=*&valueCodes[Tid]=from(2023)"            # population, years 2023 ->
-           "&outputFormat=csv&outputFormatParams=separatorsemicolon")          # CSV with ';' like the manual export
+           "&outputFormat=csv&outputFormatParams=separatorsemicolon,usecodesandtexts")  # ';' + code AND name ('3101 Halden')
 # Sex and age are left out of the query -> SSB sums them ("elimination"), so we get total population.
 
 SOURCES = [                                                                    # the datasets the pipeline handles
