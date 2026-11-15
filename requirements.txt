@@ -7,3 +7,5 @@ pyarrow
 pytest
 jupyter
 ipykernel
+matplotlib       # plots in the Gold dashboard (notebook 03)
+ruff             # lint step in the workflows (syntax errors, undefined names)

@@ -9,11 +9,13 @@ Usage:
     python run_pipeline.py bronze      # sources -> raw files in the landing folder (/tmp/norgespris-landing/<env>)
     python run_pipeline.py postgres    # landing files -> PostgreSQL schema bronze (the Bronze layer)
     python run_pipeline.py silver      # bronze schema -> silver schema (clean, typed, daily)
-    python run_pipeline.py all         # every stage, in order: bronze -> postgres -> silver
+    python run_pipeline.py gold        # silver schema -> gold schema (star schema + dashboard tables, checked, published)
+    python run_pipeline.py all         # every stage, in order: bronze -> postgres -> silver -> gold
     python run_pipeline.py --help
 
-Silver and Gold are added here as new stages when they are built
-(one function per layer, same return contract: {"status": ..., "elapsed_time": ...}).
+One function per layer, same return contract: {"status": ..., "elapsed_time": ...}.
+A stage that does not return "success" stops the run, so a later layer never
+runs on bad input (Gold is never rebuilt from a failed Silver run).
 """
 
 import argparse                                   # read the command-line argument (which stage to run)
@@ -44,11 +46,18 @@ def run_silver():
     return silver()
 
 
-# Stages in the order they must run. Add "gold" here later.
+def run_gold():
+    """Gold: star schema + dashboard tables from the silver schema; published only if all checks pass."""
+    from gold_pipeline import run_gold as gold   # imports Spark only when this stage runs
+    return gold()
+
+
+# Stages in the order they must run.
 STAGES = {
     "bronze": run_bronze,       # 1. sources -> raw files in /tmp/norgespris-landing/<env>
     "postgres": run_postgres,   # 2. landing files -> PostgreSQL norgespris_<env>, schema bronze
     "silver": run_silver,       # 3. schema bronze -> schema silver (same database)
+    "gold": run_gold,           # 4. schema silver -> schema gold (via gold_stage, old version kept in gold_previous)
 }
 
 

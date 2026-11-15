@@ -10,6 +10,7 @@ date, municipality matching, PT0H first, county average.
 import os
 import sys
 from datetime import date
+from decimal import Decimal
 
 import pytest
 from pyspark.sql import SparkSession
@@ -73,7 +74,7 @@ def test_consumption_rejects_dedup_and_local_date(spark, municipalities):
         ("2025-10-26T03:00:00.000+01:00", "0", "Ukjent", "business", "7.000000", "9", old, "r1"),     # unknown municipality
     ]
     daily, rejects, hourly = sp.clean_consumption(bronze_df(spark, CONS_COLS, rows), municipalities)
-    got = {(r.municipality_no, r.date, r.consumption_group): (float(r.kwh), r.n_hours, r.known_municipality)
+    got = {(r.municipality_no, r.date, r.customer_group): (float(r.kwh), r.n_hours, r.known_municipality)
            for r in daily.collect()}
     assert got == {
         ("0301", date(2025, 10, 25), "household"): (10.0, 1, True),
@@ -269,3 +270,45 @@ def test_population_both_layouts_in_bronze(spark):
     population, municipality, rejects = sp.clean_population(df)
     assert [(r.municipality_no, r.year, r.population) for r in population.collect()] == [("3101", 2025, 32038)]  # newest file
     assert municipality.first().municipality_name == "Halden" and rejects.count() == 0
+
+
+def test_municipality_gets_county_name_and_price_area(spark):
+    munis = spark.createDataFrame([("4601", "Bergen", "46"), ("9901", "Somewhere", "99")],
+                                  "municipality_no string, municipality_name string, county_no string")
+    got = {r.municipality_no: (r.county_name, r.price_area) for r in sp.add_county(munis).collect()}
+    assert got == {"4601": ("Vestland", "NO5"), "9901": ("Unknown county", "unknown")}
+
+
+def split_inputs(spark, count_rows):
+    """Tiny Silver tables for the distribution key: Oslo (NO1), private 1 000 kWh / 100 meters on one day."""
+    def df(table, rows):
+        return spark.createDataFrame(rows, ", ".join(f"{n} {t}" for n, t in sp.SILVER_SCHEMAS[table]))
+    d = date(2026, 1, 15)
+    consumption = df("consumption_daily", [
+        ("0301", d, "private", Decimal("1000.000"), 100, 24, True, True, None),
+        ("0301", d, "business", Decimal("5000.000"), 10, 24, True, True, None)])        # not split
+    municipality = df("municipality", [("0301", "Oslo", "03", "Oslo", "NO1")])
+    count = df("norgespris_count_daily", count_rows)
+    price_area = df("norgespris_price_area_daily", [                                    # per meter: household 40, cabin 20
+        (d, "NO1", "household", None, None, Decimal("0"), Decimal("0"), Decimal("4000"), 0, 0, 100),
+        (d, "NO1", "cabin", None, None, Decimal("0"), Decimal("0"), Decimal("200"), 0, 0, 10)])
+    return consumption, municipality, count, price_area
+
+
+def test_private_split_with_municipality_meter_mix(spark):
+    d = date(2026, 1, 15)
+    count_rows = [("0301", d, "household", 30, 75, Decimal("0.4"), True),                # 75 % household meters
+                  ("0301", d, "cabin", 5, 25, Decimal("0.2"), True)]
+    row = sp.split_private(*split_inputs(spark, count_rows)).first()
+    assert row.household_meter_share == pytest.approx(0.75)
+    assert row.household_kwh_share == pytest.approx(0.75 * 40 / (0.75 * 40 + 0.25 * 20))  # = 0.857
+    assert row.kwh_household + row.kwh_cabin == row.kwh_private == Decimal("1000.000")    # nothing lost
+    assert (row.metering_points_household, row.metering_points_cabin) == (75, 25)
+    assert float(row.norgespris_share_household) == 0.4 and float(row.norgespris_share_private) == 0.35
+    assert row.key_method == "municipality"
+
+
+def test_private_split_falls_back_to_price_area_mix(spark):
+    row = sp.split_private(*split_inputs(spark, [])).first()                            # no counts for Oslo
+    assert row.household_meter_share == pytest.approx(100 / 110)                        # NO1: 100 household, 10 cabin meters
+    assert row.key_method == "price_area" and row.norgespris_share_household is None

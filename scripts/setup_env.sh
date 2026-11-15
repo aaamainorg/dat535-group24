@@ -6,14 +6,14 @@
 #
 # What it does:
 #   1. creates a Python virtual environment if it does not exist yet
-#      (default ~/spark-env, change with DAT535_VENV)
+#      (default ~/spark-env, change with NORGESPRIS_VENV)
 #   2. installs requirements.txt into it (fast when already installed)
 #   3. finds Java (PySpark needs it) and checks it is there
 #   4. inside GitHub Actions: makes the venv and JAVA_HOME available to the next steps
 # =============================================================================
 set -euo pipefail                                   # stop on the first error, on unset variables and in pipes
 
-VENV="${DAT535_VENV:-$HOME/spark-env}"              # where the virtual environment lives
+VENV="${NORGESPRIS_VENV:-$HOME/spark-env}"              # where the virtual environment lives
 
 # --- 1. Python virtual environment -------------------------------------------
 if [ ! -x "$VENV/bin/python" ]; then                # no venv yet -> create it
@@ -23,16 +23,20 @@ fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"                         # use the venv's python and pip below
 
+sudo apt install -y python3.12-venv python3-pip
 # --- 2. Python packages --------------------------------------------------------
 pip install --quiet --upgrade pip                   # newer pip resolves packages better
 pip install --quiet -r requirements.txt             # no-op when everything is already installed
 
 # --- 3. Java ---------------------------------------------------------------------
+sudo apt install -y openjdk-17-jdk
+
 if [ -z "${JAVA_HOME:-}" ] && [ -x /usr/libexec/java_home ]; then   # macOS: ask the system where Java is
   JAVA_HOME="$(/usr/libexec/java_home 2>/dev/null || true)"
 fi
 if [ -n "${JAVA_HOME:-}" ]; then                    # put that Java first on the PATH
-  export JAVA_HOME
+  export export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+  echo "JAVA_HOME set to $JAVA_HOME"
   export PATH="$JAVA_HOME/bin:$PATH"
 fi
 if ! java -version >/dev/null 2>&1; then            # no Java at all -> clear error message

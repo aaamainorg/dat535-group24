@@ -37,6 +37,7 @@ PG_PROPERTIES = {"user": PG_USER, "password": PG_PASSWORD,      # login for ever
                  "driver": "org.postgresql.Driver"}             # Java class of the PostgreSQL driver
 PG_JDBC_PACKAGE = "org.postgresql:postgresql:42.7.4"            # Maven coordinates of the driver
 PG_JDBC_JAR = os.environ.get("NORGESPRIS_PG_JDBC_JAR", "").strip()  # optional: local .jar instead of Maven
+SPARK_DRIVER_MEMORY = os.environ.get("NORGESPRIS_SPARK_DRIVER_MEMORY", "2g")  # lower (e.g. 1g) on a machine with little RAM
 
 
 def get_spark():
@@ -45,7 +46,7 @@ def get_spark():
                .appName("DAT535-Group24-Bronze")                # name in the Spark UI
                .config("spark.sql.adaptive.enabled", "true")    # let Spark tune partitions/joins at runtime
                .config("spark.sql.shuffle.partitions", "8")     # small data -> few shuffle partitions
-               .config("spark.driver.memory", "2g")             # enough for this data on a laptop
+               .config("spark.driver.memory", SPARK_DRIVER_MEMORY)  # Java heap for Spark (local mode: driver = executor)
                .config("spark.sql.debug.maxToStringFields", "200"))  # wide tables: no "Truncated the string representation" warning
     if PG_JDBC_JAR:                                             # a downloaded driver file ...
         builder = builder.config("spark.jars", PG_JDBC_JAR)

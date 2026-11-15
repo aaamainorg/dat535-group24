@@ -66,9 +66,10 @@ def write_silver(df, table):
 
 
 SILVER_SCHEMAS = {
-    "municipality": [("municipality_no", "string"), ("municipality_name", "string"), ("county_no", "string")],
+    "municipality": [("municipality_no", "string"), ("municipality_name", "string"), ("county_no", "string"),
+                     ("county_name", "string"), ("price_area", "string")],
     "population_yearly": [("municipality_no", "string"), ("year", "int"), ("population", "int")],
-    "consumption_daily": [("municipality_no", "string"), ("date", "date"), ("consumption_group", "string"),
+    "consumption_daily": [("municipality_no", "string"), ("date", "date"), ("customer_group", "string"),
                           ("kwh", "decimal(18,3)"), ("metering_points", "int"), ("n_hours", "int"),
                           ("complete_day", "boolean"), ("known_municipality", "boolean"),
                           ("last_update_time", "timestamp")],
@@ -87,17 +88,27 @@ SILVER_SCHEMAS = {
     "norgespris_count_daily": [("municipality_no", "string"), ("date", "date"), ("consumption_group", "string"),
                                ("metering_points_norgespris", "int"), ("metering_points_total", "int"),
                                ("norgespris_share", "decimal(6,4)"), ("known_municipality", "boolean")],
+    "private_split_daily": [("municipality_no", "string"), ("date", "date"), ("price_area", "string"),
+                            ("kwh_private", "decimal(18,3)"), ("metering_points_private", "int"),
+                            ("household_meter_share", "double"), ("household_kwh_share", "double"),
+                            ("kwh_household", "decimal(18,3)"), ("kwh_cabin", "decimal(18,3)"),
+                            ("metering_points_household", "int"), ("metering_points_cabin", "int"),
+                            ("norgespris_meters_household", "int"), ("counted_meters_household", "int"),
+                            ("norgespris_meters_cabin", "int"), ("counted_meters_cabin", "int"),
+                            ("norgespris_share_household", "decimal(6,4)"), ("norgespris_share_cabin", "decimal(6,4)"),
+                            ("norgespris_share_private", "decimal(6,4)"), ("key_method", "string")],
 }
 
 KEYS = {                                                        # the grain of every table (= what must be unique)
     "municipality": ["municipality_no"],
     "population_yearly": ["municipality_no", "year"],
-    "consumption_daily": ["municipality_no", "date", "consumption_group"],
+    "consumption_daily": ["municipality_no", "date", "customer_group"],
     "weather_station": ["station_id"],
     "temperature_station_daily": ["station_id", "date"],
     "temperature_municipality_daily": ["municipality_no", "date"],
     "norgespris_price_area_daily": ["date", "price_area", "consumption_group", "eac_from_kwh", "eac_to_kwh"],
     "norgespris_count_daily": ["municipality_no", "date", "consumption_group"],
+    "private_split_daily": ["municipality_no", "date"],
 }
 
 
@@ -170,6 +181,23 @@ def match_municipality(df, code_col, name_col, municipalities):
                .drop("_ref_no", "_ref_name", "_name_no"))
 
 
+COUNTIES = {                                                    # county number -> (name, main price area) - reference data
+    "03": ("Oslo", "NO1"), "31": ("Østfold", "NO1"), "32": ("Akershus", "NO1"), "33": ("Buskerud", "NO1"),
+    "34": ("Innlandet", "NO1"), "39": ("Vestfold", "NO1"), "40": ("Telemark", "NO2"), "42": ("Agder", "NO2"),
+    "11": ("Rogaland", "NO2"), "46": ("Vestland", "NO5"), "15": ("Møre og Romsdal", "NO3"), "50": ("Trøndelag", "NO3"),
+    "18": ("Nordland", "NO4"), "55": ("Troms", "NO4"), "56": ("Finnmark", "NO4"),
+}
+
+
+def add_county(municipality):
+    """+ county_name and the county's main price_area (unknown county -> 'Unknown county' / 'unknown')."""
+    ref = municipality.sparkSession.createDataFrame([(no, name, area) for no, (name, area) in COUNTIES.items()],
+                                                    "county_no string, county_name string, price_area string")
+    return (municipality.join(F.broadcast(ref), "county_no", "left")
+            .withColumn("county_name", F.coalesce("county_name", F.lit("Unknown county")))
+            .withColumn("price_area", F.coalesce("price_area", F.lit("unknown"))))
+
+
 def clean_population(bronze):
     """bronze.population_07459 (wide) -> (population_yearly, municipality, rejects)."""
     region_cols = ([c for c in bronze.columns if re.search(r"region|kommune", c, re.IGNORECASE)]
@@ -193,6 +221,7 @@ def clean_population(bronze):
     good = newest_per_key(good, ["municipality_no", "year"], [F.desc("_landing_run_id")])  # same year twice -> newest file
     municipality = (newest_per_key(good, ["municipality_no"], [F.desc("year")])  # name from the newest year
                     .withColumn("county_no", F.substring("municipality_no", 1, 2)))
+    municipality = add_county(municipality)                     # + county name and main price area
     return conform(good, "population_yearly"), conform(municipality, "municipality"), rejects
 
 
@@ -204,7 +233,7 @@ def clean_consumption(bronze, municipalities):
         F.expr("try_cast(substring(START_TIME, 1, 10) AS DATE)").alias("date"),  # LOCAL date, as written by Elhub
         F.lpad(F.trim("MUNICIPALITY_NUMBER"), 4, "0").alias("municipality_code"),  # '301' -> '0301', '0' -> '0000'
         F.col("NAME").alias("name"),
-        F.lower(F.trim("CONSUMPTION_GROUP")).alias("consumption_group"),
+        F.lower(F.trim("CONSUMPTION_GROUP")).alias("customer_group"),     # Elhub's name; it is the CUSTOMER group
         try_cast("QUANTITY_KWH", "decimal(18,3)").alias("kwh"),
         try_cast("METERING_POINT_COUNT", "int").alias("metering_points"),
         try_cast("LAST_UPDATE_TIME", "timestamp").alias("last_update_time"),
@@ -214,12 +243,12 @@ def clean_consumption(bronze, municipalities):
         ("CONS-02", F.col("kwh").isNull()),
         ("CONS-03", F.col("kwh") < 0),
         ("CONS-04", F.col("municipality_code").isNull() | (F.col("municipality_code") == "")),
-        ("CONS-05", F.col("consumption_group").isNull() | (F.col("consumption_group") == "")),
+        ("CONS-05", F.col("customer_group").isNull() | (F.col("customer_group") == "")),
     ], "consumption_daily")
     good = match_municipality(good, "municipality_code", "name", municipalities)  # old codes -> today's code
-    deduped = newest_per_key(good, ["start_time", "municipality_no", "consumption_group"],
+    deduped = newest_per_key(good, ["start_time", "municipality_no", "customer_group"],
                              [F.desc_nulls_last("last_update_time"), F.desc("_landing_run_id")])
-    daily = (deduped.groupBy("municipality_no", "date", "consumption_group")
+    daily = (deduped.groupBy("municipality_no", "date", "customer_group")
                     .agg(F.sum("kwh").alias("kwh"),                          # kWh per local day
                          F.max("metering_points").alias("metering_points"),  # metering points that day
                          F.count("*").alias("n_hours"),                      # hours with data
@@ -337,7 +366,7 @@ def clean_norgespris(bronze):
     return conform(good, "norgespris_price_area_daily"), rejects
 
 
-GROUP_NAMES = {"cabins and holiday properties": "cabin"}         # Elhub's long names -> names used in consumption_daily
+GROUP_NAMES = {"cabins and holiday properties": "cabin"}         # Elhub's long names -> the short names of the price-area file
 
 
 def find_col(df, prefix, exact=False):
@@ -383,6 +412,84 @@ def clean_norgespris_count(bronze, municipalities):
                             F.when(F.col("metering_points_total") > 0,
                                    F.round(F.col("metering_points_norgespris") / F.col("metering_points_total"), 4))))
     return conform(good, "norgespris_count_daily"), rejects
+
+
+def split_private(consumption, municipality, count, price_area):
+    """Private kWh and meters per municipality x day -> household + cabin with a distribution key (Spark SQL)."""
+    s = consumption.sparkSession
+    consumption.createOrReplaceTempView("k_consumption")
+    municipality.createOrReplaceTempView("k_municipality")
+    count.createOrReplaceTempView("k_count")
+    price_area.createOrReplaceTempView("k_price_area")
+    df = s.sql("""
+        WITH private AS (                     -- the Norgespris-eligible customer group, known municipalities
+            SELECT c.municipality_no, c.date, m.price_area,
+                   c.kwh AS kwh_private, c.metering_points AS metering_points_private
+            FROM k_consumption c JOIN k_municipality m ON m.municipality_no = c.municipality_no
+            WHERE c.customer_group = 'private' AND c.known_municipality),
+        use_day AS (                          -- kWh per meter per day for households and cabins, per price area
+            SELECT price_area, date,
+                   try_divide(SUM(CASE WHEN consumption_group = 'household' THEN CAST(kwh_total AS DOUBLE) END),
+                              SUM(CASE WHEN consumption_group = 'household' THEN metering_points_total END)) AS kwh_per_household,
+                   try_divide(SUM(CASE WHEN consumption_group = 'cabin' THEN CAST(kwh_total AS DOUBLE) END),
+                              SUM(CASE WHEN consumption_group = 'cabin' THEN metering_points_total END))     AS kwh_per_cabin
+            FROM k_price_area GROUP BY price_area, date),
+        use_month AS (                        -- fallback for a missing day: average of the same calendar month
+            SELECT price_area, month(date) AS month,
+                   AVG(kwh_per_household) AS kwh_per_household, AVG(kwh_per_cabin) AS kwh_per_cabin
+            FROM use_day GROUP BY price_area, month(date)),
+        mix_municipality AS (                 -- household share of the municipality's household + cabin meters
+            SELECT municipality_no,
+                   try_divide(SUM(CASE WHEN consumption_group = 'household' THEN CAST(metering_points_total AS DOUBLE) END),
+                              SUM(metering_points_total)) AS household_meter_share
+            FROM k_count WHERE known_municipality AND consumption_group IN ('household', 'cabin')
+            GROUP BY municipality_no),
+        mix_price_area AS (                   -- fallback: the same share for the whole price area
+            SELECT price_area,
+                   try_divide(SUM(CASE WHEN consumption_group = 'household' THEN CAST(metering_points_total AS DOUBLE) END),
+                              SUM(metering_points_total)) AS household_meter_share
+            FROM k_price_area WHERE consumption_group IN ('household', 'cabin') GROUP BY price_area),
+        meters AS (                           -- Norgespris meters per municipality and day, household and cabin side by side
+            SELECT municipality_no, date,
+                   SUM(CASE WHEN consumption_group = 'household' THEN metering_points_norgespris END) AS np_household,
+                   SUM(CASE WHEN consumption_group = 'household' THEN metering_points_total END)      AS counted_household,
+                   SUM(CASE WHEN consumption_group = 'cabin' THEN metering_points_norgespris END)     AS np_cabin,
+                   SUM(CASE WHEN consumption_group = 'cabin' THEN metering_points_total END)          AS counted_cabin
+            FROM k_count WHERE known_municipality GROUP BY municipality_no, date),
+        keyed AS (
+            SELECT p.*,
+                   COALESCE(mm.household_meter_share, mp.household_meter_share) AS s,          -- meter mix
+                   CASE WHEN mm.household_meter_share IS NOT NULL THEN 'municipality'
+                        WHEN mp.household_meter_share IS NOT NULL THEN 'price_area' END AS mix_from,
+                   COALESCE(d.kwh_per_household, mo.kwh_per_household) AS ih,                 -- use per household meter
+                   COALESCE(d.kwh_per_cabin, mo.kwh_per_cabin) AS ic                           -- use per cabin meter
+            FROM private p
+            LEFT JOIN mix_municipality mm ON mm.municipality_no = p.municipality_no
+            LEFT JOIN mix_price_area mp ON mp.price_area = p.price_area
+            LEFT JOIN use_day d ON d.price_area = p.price_area AND d.date = p.date
+            LEFT JOIN use_month mo ON mo.price_area = p.price_area AND mo.month = month(p.date)),
+        shared AS (                           -- household share of the kWh: s*ih / (s*ih + (1-s)*ic)
+            SELECT k.*, COALESCE(try_divide(k.s * k.ih, k.s * k.ih + (1 - k.s) * k.ic), k.s) AS household_kwh_share
+            FROM keyed k)
+        SELECT x.municipality_no, x.date, x.price_area, x.kwh_private, x.metering_points_private,
+               x.s AS household_meter_share, x.household_kwh_share,
+               CAST(x.kwh_private * x.household_kwh_share AS DECIMAL(18,3))                     AS kwh_household,
+               x.kwh_private - CAST(x.kwh_private * x.household_kwh_share AS DECIMAL(18,3))     AS kwh_cabin,
+               CAST(ROUND(x.metering_points_private * x.s) AS INT)                               AS metering_points_household,
+               x.metering_points_private - CAST(ROUND(x.metering_points_private * x.s) AS INT)   AS metering_points_cabin,
+               n.np_household AS norgespris_meters_household, n.counted_household AS counted_meters_household,
+               n.np_cabin AS norgespris_meters_cabin, n.counted_cabin AS counted_meters_cabin,
+               ROUND(try_divide(CAST(n.np_household AS DOUBLE), n.counted_household), 4)         AS norgespris_share_household,
+               ROUND(try_divide(CAST(n.np_cabin AS DOUBLE), n.counted_cabin), 4)                 AS norgespris_share_cabin,
+               ROUND(try_divide(CAST(COALESCE(n.np_household, 0) + COALESCE(n.np_cabin, 0) AS DOUBLE),
+                                COALESCE(n.counted_household, 0) + COALESCE(n.counted_cabin, 0)), 4) AS norgespris_share_private,
+               CASE WHEN x.s IS NULL THEN NULL
+                    WHEN x.ih IS NULL OR x.ic IS NULL THEN concat(x.mix_from, ' (meters only)')
+                    ELSE x.mix_from END                                                          AS key_method
+        FROM shared x
+        LEFT JOIN meters n ON n.municipality_no = x.municipality_no AND n.date = x.date
+    """)
+    return conform(df, "private_split_daily")
 
 
 def duplicate_keys(df, table):
@@ -516,6 +623,30 @@ def run_silver():
         npc_in.unpersist()
     else:
         logger.info("  norgespris_count_per_municipality_consumption_group not in Bronze - skipped (optional)")
+
+    # --- 4.6 distribution key: private -> household + cabin -------------------------------------------
+    def written(table):                                         # a Silver table read back (empty if it was skipped)
+        if table in rows:
+            return spark.read.jdbc(PG_URL, f"silver.{table}", properties=JDBC_READ)
+        return spark.createDataFrame([], ", ".join(f"{n} {t}" for n, t in SILVER_SCHEMAS[table]))
+    split = split_private(written("consumption_daily"), municipality, written("norgespris_count_daily"),
+                          written("norgespris_price_area_daily")).persist(StorageLevel.MEMORY_AND_DISK)
+    rows["private_split_daily"] = write_silver(split, "private_split_daily")
+    s = split.agg(F.sum("kwh_private").alias("private"),
+                  F.sum(F.col("kwh_household") + F.col("kwh_cabin")).alias("split"),
+                  F.sum(F.when(F.col("key_method").isNull(), 1)).alias("no_key"),
+                  F.countDistinct(F.when(F.col("key_method").startswith("price_area"), F.col("municipality_no"))).alias("pa"),
+                  F.sum(F.when(F.col("counted_meters_household").isNotNull(), F.col("metering_points_private"))).alias("mp"),
+                  F.sum(F.coalesce("counted_meters_household", F.lit(0))
+                        + F.coalesce("counted_meters_cabin", F.lit(0))).alias("counted")).first()
+    metric("private_split_daily", "silver_rows", rows["private_split_daily"])
+    metric("private_split_daily", "duplicate_keys", duplicate_keys(split, "private_split_daily"))
+    metric("private_split_daily", "kwh_not_split", float(s["private"] or 0) - float(s["split"] or 0))  # must be 0
+    metric("private_split_daily", "rows_without_key", s["no_key"])
+    metric("private_split_daily", "municipalities_mix_from_price_area", s["pa"])
+    metric("private_split_daily", "private_vs_counted_meters_pct",            # ~100 if private = household + cabin
+           100 * float(s["mp"]) / float(s["counted"]) if s["mp"] and s["counted"] else 0)
+    split.unpersist()
     municipality.unpersist()
 
     # --- rejects and metrics -------------------------------------------------------------------------

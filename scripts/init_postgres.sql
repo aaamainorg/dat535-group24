@@ -5,6 +5,7 @@
 --   * the login role  norgespris  (password given on the command line, never stored here)
 --   * two databases   norgespris_dev  and  norgespris_prod   (one per environment)
 --   * three schemas   bronze, silver, gold   in each database (the Medallion layers)
+--     (the gold stage creates gold_stage and gold_previous itself - the role owns the database)
 --
 -- Run it ONCE as a PostgreSQL superuser, from the repo root:
 --   macOS (Homebrew):  psql -d postgres -v pw='choose-a-password' -f scripts/init_postgres.sql

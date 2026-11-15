@@ -2,8 +2,8 @@
 
 Batch data pipeline (PySpark, Medallion architecture, **PostgreSQL** as target) for the course **DAT535 Data Engineering** at UiS, autumn 2026.
 
-**Question:** has daily electricity use per inhabitant in each Norwegian municipality changed after Norgespris
-started (1 October 2025), taking temperature into account – and where is the change largest?
+**Question:** has daily electricity use per household and per inhabitant changed after Norgespris started
+(1 October 2025), taking temperature into account – and where (price area, county, municipality) is the change largest?
 
 | Source | Data | How |
 |---|---|---|
@@ -19,7 +19,8 @@ started (1 October 2025), taking temperature into account – and where is the c
 | Scope, dataset, landing (raw files) | ✅ done | `notebooks/01_bronze.ipynb` sections 1–4, `bronze_pipeline.py` |
 | Bronze (PostgreSQL schema `bronze`) | ✅ done | notebook 01 section 5, `bronze_to_postgres.py` |
 | Silver (PostgreSQL schema `silver`) | ✅ done | `notebooks/02_silver.ipynb`, `silver_pipeline.py` |
-| Gold + dashboard | ⏳ | – |
+| Gold (PostgreSQL schema `gold`: star schema + dashboard tables) | ✅ done | `notebooks/03_gold.ipynb`, `gold_pipeline.py` |
+| Dashboard (tables, plots, trend analysis) | ✅ done | `notebooks/03_gold.ipynb` section 8 (reads only the published `gold` tables) |
 
 ## Repository structure
 
@@ -28,25 +29,28 @@ started (1 October 2025), taking temperature into account – and where is the c
 ├── README.md
 ├── env.example                            # template for .env (credentials + settings) - copy to .env, never commit .env
 ├── requirements.txt                       # Python packages
-├── run_pipeline.py                        # one entry point: python run_pipeline.py bronze | postgres | all
+├── run_pipeline.py                        # one entry point: python run_pipeline.py bronze | postgres | silver | gold | all
 ├── bronze_pipeline.py                     # stage "bronze":   sources -> landing files (generated from notebook 01, 3.1-3.9)
 ├── bronze_to_postgres.py                  # stage "postgres": landing files -> PostgreSQL schema bronze (notebook 01, 4.1/4.2/4.5/5)
 ├── silver_pipeline.py                     # stage "silver":   schema bronze -> schema silver (generated from notebook 02)
+├── gold_pipeline.py                       # stage "gold":     schema silver -> schema gold   (generated from notebook 03)
 ├── notebooks/
 │   ├── 01_bronze.ipynb                    # sections 1-3 of the project definition + load into PostgreSQL, every line explained
-│   └── 02_silver.ipynb                    # section 4: Silver design + cleaning, every line explained
+│   ├── 02_silver.ipynb                    # section 4: Silver design + cleaning, every line explained
+│   └── 03_gold.ipynb                      # sections 5-6: Kimball star schema, checks, publishing + the dashboard
 ├── tests/
 │   ├── test_bronze.py                     # pytest, no internet or Spark needed
 │   ├── test_postgres.py                   # pytest for the PostgreSQL settings (no database needed)
-│   └── test_silver.py                     # pytest for every Silver cleaning function (local Spark, no database)
+│   ├── test_silver.py                     # pytest for every Silver cleaning function (local Spark, no database)
+│   └── test_gold.py                       # pytest: whole star schema from hand-made Silver rows with a known answer
 ├── scripts/
 │   ├── setup_env.sh                       # prepares Python venv + Java (used by every workflow)
 │   ├── init_postgres.sql                  # one-time PostgreSQL setup: role, databases, schemas
 │   └── manifest_summary.py                # writes the Bronze run table on the GitHub Actions run page
 └── .github/workflows/
-    ├── norgespris-dev.yml                 # push to dev / manual       -> tests + pipeline (dev)
-    ├── norgespris-prod.yml                # push to main / manual      -> tests + pipeline (prod, approval)
-    └── pipeline.yml                       # monthly schedule / manual  -> pipeline (prod)
+    ├── norgespris-dev.yml                 # push to dev / manual       -> lint + tests + pipeline (dev)
+    ├── norgespris-prod.yml                # push to main / manual      -> lint + tests + pipeline (prod, approval)
+    └── pipeline.yml                       # monthly schedule / manual  -> lint + tests + pipeline (prod)
 ```
 
 Data is **not** stored in git. The data flow on the machine that runs the pipeline:
@@ -72,7 +76,13 @@ PostgreSQL norgespris_<dev|prod>
 │   ├── weather_station, temperature_station_daily, temperature_municipality_daily
 │   ├── norgespris_price_area_daily
 │   └── rejects, quality_metrics          # rejected records (with rule id) and quality history
-└── gold.*                                 # later
+├── gold_stage.*                           # stage "gold" builds here first (emptied every run)
+├── gold.*                                 # GOLD (published only if all checks pass): Kimball star schema + dashboard tables
+│   ├── dim_date, dim_municipality, dim_consumption_group, dim_price_area
+│   ├── fact_consumption_daily, fact_weather_daily, fact_population_yearly, fact_norgespris_price_area_daily
+│   ├── agg_municipality_daily, agg_area_daily, agg_norgespris_effect, agg_monthly_trend, agg_norgespris_uptake_daily
+│   └── publish_log, check_results          # monitoring: which version is live, every check of every run
+└── gold_previous.*                        # the Gold version before the current one (kept for comparison / rollback)
 ```
 
 Why the landing folder is in `/tmp`: raw files are short-lived input – after the `postgres` stage the data is in the
@@ -212,9 +222,12 @@ start it by hand: *Actions → Pipeline → Run workflow*.
 | `norgespris-prod.yml` | push to `main` (after PR), manual with stage choice | `main` (approval) | `/tmp/norgespris-landing/prod` | `norgespris_prod` |
 | `pipeline.yml` | monthly (5th, 06:00 UTC), manual | – | `/tmp/norgespris-landing/prod` | `norgespris_prod` |
 
-Every workflow runs `python run_pipeline.py all` = stage `bronze` (sources → landing files), stage `postgres` (landing → `bronze` tables) and stage `silver` (`bronze` → `silver` tables).
+Every workflow first runs a **lint** step (`ruff`: syntax errors and undefined names) and the **unit tests**, then
+`python run_pipeline.py all` = stage `bronze` (sources → landing files), stage `postgres` (landing → `bronze` tables), stage `silver`
+(`bronze` → `silver` tables) and stage `gold` (`silver` → `gold` tables). A stage that fails stops the run, so Gold is never built from a failed Silver run.
 
-Each run shows the landing manifest as a table on the run page (prod) and uploads `_manifest.csv` as an artifact.
+Each run shows the landing manifest (prod) and the **Gold run summary** (published or blocked, rows per table, every check) on the run page,
+and uploads `_manifest.csv` and `_gold_summary.md` as an artifact.
 Prod runs never overlap (`concurrency` group), because they write to the same folder and database.
 
 ## Credentials and settings (`.env`)
@@ -236,6 +249,8 @@ cp env.example .env       # once, in the repo root
   the workflows use their own defaults (see the `env:` block in each workflow file).
 - **Landing folder:** `NORGESPRIS_LANDING_ROOT` (default `/tmp/norgespris-landing`; `dev/` or `prod/` is added).
 - **PostgreSQL:** `NORGESPRIS_PG_HOST`, `_PORT`, `_USER`, `_PASSWORD` (and optional `_DATABASE`, `_JDBC_JAR`) – see *Setup: PostgreSQL*.
+- **Spark memory:** `NORGESPRIS_SPARK_DRIVER_MEMORY` (default `2g`). Spark's Java process uses about this + 0.5 GB of RAM.
+  On a machine with ≤ 8 GB RAM set `1g` (Gold measured at full size: 1.5 GB peak instead of 2.5 GB, same speed – notebook 03, section 9).
 - If a value leaks (e.g. committed by mistake): create a new Frost client and delete the old one, and change the
   PostgreSQL password (`ALTER ROLE norgespris PASSWORD '...';`) – removing the file from git is not enough.
 
@@ -248,13 +263,32 @@ python run_pipeline.py all               # dev by default: sources -> /tmp/norge
 python run_pipeline.py bronze            # only download/copy raw files into the landing folder
 python run_pipeline.py postgres          # only (re)load the landing files into the bronze schema
 python run_pipeline.py silver            # only rebuild the silver schema from the bronze schema
+python run_pipeline.py gold              # only rebuild, check and publish the gold schema from the silver schema
 NORGESPRIS_ENV=prod python run_pipeline.py all   # by hand in prod (/tmp/norgespris-landing/prod, norgespris_prod)
 
 pytest -q tests/                         # unit tests
 jupyter notebook notebooks/              # the notebooks
 ```
 
+**Memory:** every notebook kernel with Spark keeps its own Java process (1.5–2.5 GB RAM) until the kernel stops. Run **one** notebook with
+Spark at a time and run its last cell (`spark.stop()`) before you open the next. If Linux kills processes (`sudo dmesg | grep -i "out of memory"`),
+check what uses the RAM with `ps -eo pid,rss,comm --sort=-rss | head` and lower `NORGESPRIS_SPARK_DRIVER_MEMORY`.
+
 Re-running is safe: files already in the landing folder (same checksum) are skipped, and a `bronze` table is only rewritten when its landing files changed.
+Gold is rebuilt completely every run, but only **published** (moved from `gold_stage` to `gold` in one transaction) when every error check passes.
+
+**Meaningful Gold results** need data before *and* after 1 October 2025 (about 6 months before, 1 month after). Prod (from 2024-01) has that.
+For dev, set e.g. `NORGESPRIS_DEV_START_MONTH=2025-01` and an empty end month; with a short dev period Gold still runs, but flags its results as not reliable.
+
+## Using the Gold layer (dashboard / analysts)
+
+1. Is a new version ready? `SELECT status, first_day, last_day, logged_at FROM gold.publish_log ORDER BY logged_at DESC LIMIT 1;`
+   (`published` = live; `blocked` = checks failed, the previous version is still live – see `gold.check_results`).
+2. The answer: `SELECT level, area_name, measure, adjusted_change_pct, adjusted_change_vs_business_pp, reliable FROM gold.agg_norgespris_effect WHERE level IN ('national', 'price_area') ORDER BY level, area_name, measure;`
+3. Daily/monthly trends: `gold.agg_area_daily`, `gold.agg_monthly_trend`; your own questions: join the `fact_*` tables to the `dim_*` tables.
+
+Notebook 03 section 8 is the dashboard (tables, plots, trend analysis); any BI tool that reads PostgreSQL can use the same tables.
+The method (heating degree days, baseline model before the start, business meters as control group) is explained in notebook 03, section 1.
 
 ## Branches and deployment
 
@@ -270,7 +304,8 @@ Check runs under the **Actions** tab; each run uploads the Bronze manifest as an
 ## Keeping the notebook and the script in sync
 
 `bronze_pipeline.py` contains exactly the code cells of notebook 01, sections 3.1–3.9, `bronze_to_postgres.py`
-the cells of 4.1 (settings), 4.2/4.5 (readers) and 5.1–5.2 (loader), and `silver_pipeline.py` the cells of notebook 02, sections 2 and 4–5.1.
+the cells of 4.1 (settings), 4.2/4.5 (readers) and 5.1–5.2 (loader), `silver_pipeline.py` the cells of notebook 02, sections 2 and 4–5.1,
+and `gold_pipeline.py` the cells of notebook 03, sections 2 and 4–7.1.
 When you change the logic, change the notebook cell **and** paste it into the matching `.py` file, then run `pytest`.
 
 ## Licences and credits
