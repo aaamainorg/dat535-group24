@@ -161,9 +161,10 @@ flowchart LR
 
 **What happens along the way (short):**
 1. **Landing** – files are stored as delivered (a ZIP is kept and also unpacked next to it; gzip *transfer* compression from data.elhub.no
-   is undone on download), registered in `_manifest.csv` with SHA-256, size and header; a file with a known checksum is skipped.
+   is undone on download), registered in `_manifest.csv` with SHA-256, size and header; a file with a known checksum is skipped. **Delta load** (default): after
+   the first full load only the newest complete month of the time series is downloaded (Elhub month files, Frost months).
 2. **Bronze** – the newest version of every file is loaded into one PostgreSQL table per dataset, **all columns as text**, plus
-   `_source_file`, `_landing_run_id`, `_loaded_at`. A table is only reloaded when its landing files changed.
+   `_source_file`, `_landing_run_id`, `_loaded_at`. A table is only reloaded when its landing files changed; in delta mode new month files are **appended**.
 3. **Silver** – types (`try_cast`), local dates, newest version per key, rejects with a rule id, hourly → **daily**, old municipality codes
    matched to today's, temperature per municipality (own stations or county average), county name + price area, and the
    **distribution key** that splits *private* consumption into *household* and *cabin*.
@@ -175,7 +176,7 @@ flowchart LR
 | Layer | Storage | Contains | Changes the data? | History | Idempotent re-run |
 |---|---|---|---|---|---|
 | **Landing** | files in `/tmp/norgespris-landing/<env>/` | raw files exactly as delivered + manifest | no | every new file version kept (by run id) | yes – same checksum = skipped |
-| **Bronze** | PostgreSQL schema `bronze` | one table per dataset, all text, lineage columns | no (only text + lineage) | newest version of each file; `_load_log` keeps the load history | yes – unchanged files are not reloaded |
+| **Bronze** | PostgreSQL schema `bronze` | one table per dataset, all text, lineage columns | no (only text + lineage) | newest version of each file + appended month files; `_load_log` / `_load_files` keep the load history | yes – unchanged files are not reloaded, a file is appended only once |
 | **Silver** | schema `silver` | clean, typed, one row per key, daily grain; `rejects`, `quality_metrics` | yes: types, dedup, rejects, enrichment | `quality_metrics` appended per run; tables rebuilt | yes – full rebuild from Bronze |
 | **Gold** | schema `gold` (+ `gold_stage`, `gold_previous`) | dimensions, facts, dashboard tables; `publish_log`, `check_results` | yes: modelling, aggregation, analysis | previous version in `gold_previous`; logs appended | yes – full rebuild, published only if checks pass |
 
@@ -210,7 +211,7 @@ Both environments run the **same code**; only these settings differ. See [pipeli
 |---|---|---|---|
 | D1 | Raw files land in `/tmp/norgespris-landing`, Bronze is a **PostgreSQL schema** | Bronze must be queryable; raw files are short-lived input that can be downloaded again | Parquet files as Bronze (harder to inspect, no SQL for the group) |
 | D2 | Bronze keeps **every column as text** | Bronze must not change data; a bad value never stops the load; typing happens in Silver with `try_cast` | typed Bronze (one bad value would fail the load) |
-| D3 | Elhub consumption in **snapshot** mode (whole ~3-year export) | the `.csv` export does not accept a date filter (HTTP 400) | monthly calls (only possible with JSON, much slower) |
+| D3 | **Delta load**: first run = Elhub's whole ~3-year API export, later runs = only the newest month from Elhub's month file on data.elhub.no (`…-all-en-YYYY-MM-00.csv`); time-series tables in Bronze are **appended** | the API `.csv` export accepts no date filter (HTTP 400), but Elhub publishes the same dataset per month; one month instead of three years per run | full export every run (`NORGESPRIS_LOAD_MODE=full` still possible); monthly JSON API calls (other format, much slower) |
 | D4 | Silver at **daily grain** | the question is per day; 28 M hourly rows → ~1.1 M daily rows makes every later step faster | hourly Silver (hourly detail stays in Bronze) |
 | D5 | Dates are **Norwegian local dates** (Elhub as written; Frost converted from UTC to `Europe/Oslo`) | a "day" means a Norwegian day for consumption and temperature alike | UTC days (would shift consumption by 1–2 hours) |
 | D6 | **Rejects table** with rule id instead of dropping rows silently | every removed record can be explained and counted | filtering without a trace |
@@ -218,7 +219,7 @@ Both environments run the **same code**; only these settings differ. See [pipeli
 | D8 | Gold as a **Kimball star schema** + pre-aggregated `agg_*` tables | simple, fast SQL for any question; dashboard reads small tables | one wide table (repeats data, hard to extend) |
 | D9 | Temperature adjustment with **heating degree days** and a model fitted **before** the start | removes the effect of a colder/warmer winter; standard Norwegian method (base 17 °C) | raw before/after comparison (misleading, different seasons) |
 | D10 | Gold built in `gold_stage`, **published by a schema swap in one transaction** only if all error checks pass | consumers never see half-built or wrong data; previous version kept in `gold_previous` | writing directly into `gold` |
-| D11 | **Full rebuild** of Silver and Gold every run | small data (minutes), always consistent, simple | incremental loading (more code, more failure modes) |
+| D11 | **Full rebuild** of Silver and Gold every run (also in delta mode) | small data (minutes), always consistent, simple; Silver's newest-version-per-key handles months loaded twice into Bronze | incremental Silver/Gold (more code, more failure modes) |
 | D12 | Notebook cells are the source of the `.py` files | the code the examiner reads is the code that runs | separate code and notebooks (they drift apart) |
 
 ## 9. Quality and reliability
@@ -229,7 +230,7 @@ Both environments run the **same code**; only these settings differ. See [pipeli
 | Load log, lineage columns | Bronze | [data-quality.md §2](data-quality.md#2-landing-and-bronze) |
 | Reject rules (`CONS-01`, `SSB-01`, …), quality metrics per run, unique keys | Silver | [data-quality.md §3](data-quality.md#3-silver) |
 | Checks G-01 … G-12 against Silver, publish gate, publish log | Gold | [data-quality.md §4](data-quality.md#4-gold) |
-| Unit tests (55) + lint before every pipeline run | CI | [pipelines.md](pipelines.md) |
+| Unit tests (65) + lint before every pipeline run | CI | [pipelines.md](pipelines.md) |
 | A stage that fails stops the run (Gold is never built from a failed Silver) | `run_pipeline.py` | [pipelines.md](pipelines.md) |
 
 ## 10. Performance and capacity
@@ -267,12 +268,12 @@ JDBC writes to one PostgreSQL server (most of the run time).
 
 | Limitation | Consequence | Possible improvement |
 |---|---|---|
-| Elhub's API serves only ~3 rolling years; Silver is rebuilt each run | the "before" period slowly shrinks (from spring 2027 the model has fewer pre-start days) | keep old days in Silver (append missing dates), or freeze the baseline model |
+| Elhub's API serves only ~3 rolling years; Silver is rebuilt each run | in **full** mode the "before" period slowly shrinks (from spring 2027 the model has fewer pre-start days). In **delta** mode the Bronze table keeps old months as long as no full reload happens (a full reload, e.g. after `/tmp` was cleaned, starts again from the ~3-year export) | keep old days in Silver (append missing dates), or freeze the baseline model |
 | Municipality → price area via the county's **main** price area | a few border municipalities are in the wrong price area | municipality-level reference list (NVE) as a Bronze reference file |
 | Household/cabin is an **allocation** of private | household-only changes inside one municipality cannot be seen | report `kwh_per_private_meter` (measured) next to household; better key if Elhub publishes household data per municipality |
 | Linear HDD model, no holidays/daylight/price terms | some variation unexplained (R² shown) | add weekday/holiday terms, seasonal models |
 | Other changes at the same time (prices, EVs, heat pumps) | we show change **after** Norgespris, not proof of its **effect** | business control group already included; more controls (price data) |
-| Single machine, full rebuild | fine for this volume | incremental loads, cluster, partitioned Parquet for Silver |
+| Single machine; delta only for landing and Bronze | fine for this volume | incremental Silver/Gold, cluster, partitioned Parquet for Silver |
 
 ---
 *Related:* [data-model.md](data-model.md) · [data-quality.md](data-quality.md) · [setup.md](setup.md) · [pipelines.md](pipelines.md) · notebooks `01_bronze`, `02_silver`, `03_gold`.

@@ -25,7 +25,7 @@ flowchart LR
 | Landing + Bronze (schema `bronze`) | ✅ | `notebooks/01_bronze.ipynb` → `bronze_pipeline.py`, `bronze_to_postgres.py` |
 | Silver (schema `silver`) | ✅ | `notebooks/02_silver.ipynb` → `silver_pipeline.py` |
 | Gold (schema `gold`) + dashboard | ✅ | `notebooks/03_gold.ipynb` → `gold_pipeline.py` |
-| CI/CD (lint, 55 tests, dev/prod/monthly workflows) | ✅ | `.github/workflows/`, `tests/` |
+| CI/CD (lint, 65 tests, dev/prod/monthly workflows) | ✅ | `.github/workflows/`, `tests/` |
 
 ## Documentation
 
@@ -47,9 +47,13 @@ git clone https://github.com/aaamainorg/dat535-group24.git && cd dat535-group24
 bash scripts/setup_env.sh && source ~/spark-env/bin/activate      # Python venv + Java check
 psql -d postgres -v pw='choose-a-password' -f scripts/init_postgres.sql   # once (Ubuntu: sudo -u postgres psql …)
 cp env.example .env                                                # then fill in FROST_CLIENT_ID, NORGESPRIS_PG_PASSWORD, the period
-pytest -q tests/                                                   # 55 passed
+pytest -q tests/                                                   # 65 passed
 python run_pipeline.py all                                         # bronze -> postgres -> silver -> gold (dev)
 ```
+
+**Delta load** (default, `NORGESPRIS_LOAD_MODE=delta` in `.env`): the first run downloads the full files; every later run
+downloads only the newest complete month and appends it to Bronze. `NORGESPRIS_LOAD_MODE=full` = whole files every run.
+See [docs/pipelines.md](docs/pipelines.md#full-and-delta-load).
 
 Is the result ready?
 ```sql

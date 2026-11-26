@@ -38,7 +38,8 @@ The *why* behind the model is in [architecture.md](architecture.md); quality rul
          met/frost_observations/2025-10/<run_id>__frost_obs_2025-10_l<layout>_g00.json   # month × group of 100 stations
 ```
 
-`period` = `snapshot` for whole exports, `YYYY-MM` for monthly Frost files, `manual` for files from `_manual/`.
+`period` = `snapshot` for whole exports, `YYYY-MM` for monthly files (Frost, and Elhub month files in delta mode, e.g.
+`elhub/consumption_per_group_municipality_hour/2026-10/<run_id>__consumption_per_group_municipality_hour_2026-10.csv`), `manual` for files from `_manual/`.
 
 **`_manifest.csv`** (also loaded as `bronze.manifest`):
 
@@ -113,7 +114,12 @@ erDiagram
 ```
 
 Bookkeeping tables: **`bronze.manifest`** (the landing manifest, replaced each run) and **`bronze._load_log`** (one row per dataset load:
-dataset, table, status, fingerprint of the landing files, rows, `loaded_at` – appended, so the history stays).
+dataset, table, status (`loaded` = table replaced, `appended` = delta), fingerprint of the landing files, rows, `loaded_at` – appended,
+so the history stays) and **`bronze._load_files`** (one row per landing file written to a table: `dataset`, `landing_file`,
+`load_type` = `full` / `delta`, `loaded_at`; the files of the newest `full` load plus every `delta` after it are what the table holds).
+
+In delta mode a month that is loaded again (corrected by the source) is in Bronze twice – both versions with their own `_landing_run_id`;
+Silver keeps the newest version per key.
 
 ## 4. Silver (schema `silver`)
 

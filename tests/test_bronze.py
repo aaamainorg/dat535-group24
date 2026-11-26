@@ -5,7 +5,8 @@ Tiny fake files in a temporary folder - no internet, no Spark and no real
 Frost credentials needed. They check the promises from section 3 of the
 project definition: files are stored unchanged, metadata is written,
 duplicates are skipped, schema changes are flagged, failures are visible -
-plus the Frost-specific logic (login, station groups, 404 = no data).
+plus the Frost-specific logic (login, station groups, 404 = no data) and the
+delta load (only the newest month, fallback to the full file).
 """
 
 import gzip                                                     # compress test data like data.elhub.no
@@ -192,6 +193,7 @@ def write_timeseries(state, ids):                               # helper: fake s
 
 
 def test_frost_requests_groups_months_and_skips(landing, monkeypatch):  # request list: months x groups, skips
+    monkeypatch.setattr(bp, "LOAD_MODE", "full")                # full mode: the whole period (delta is tested below)
     monkeypatch.setattr(bp, "ENV", "dev")                       # dev environment
     monkeypatch.setenv("NORGESPRIS_DEV_START_MONTH", "2025-08")             # period from .env / environment
     monkeypatch.setenv("NORGESPRIS_DEV_END_MONTH", "2025-10")   # to October
@@ -217,6 +219,7 @@ def test_frost_requests_groups_months_and_skips(landing, monkeypatch):  # reques
 
 
 def test_frost_station_membership_changes_request_identity(landing, monkeypatch):  # new station -> new file names
+    monkeypatch.setattr(bp, "LOAD_MODE", "full")                # full mode: the whole period
     monkeypatch.setattr(bp, "ENV", "dev")                       # dev environment
     monkeypatch.setenv("NORGESPRIS_DEV_START_MONTH", "2025-08")  # one month
     monkeypatch.setenv("NORGESPRIS_DEV_END_MONTH", "2025-08")   # one month
@@ -276,3 +279,119 @@ def test_month_helpers():                                       # month helper f
     assert bp.month_list("2025-11", "2026-02") == ["2025-11", "2025-12", "2026-01", "2026-02"]  # months over a year change
     assert bp.next_month("2025-12") == "2026-01"                # December -> January
     assert bp.last_complete_month(date(2026, 1, 15)) == "2025-12"  # January -> December last year
+
+
+# --- delta load (NORGESPRIS_LOAD_MODE=delta) -----------------------------------------------
+
+ELHUB_DELTA = {"source": "elhub", "dataset": "test_cons", "mode": "snapshot", "sep": ";", "required": True,  # a source ...
+               "url": "https://api.example/full.csv",           # ... with a full file ...
+               "delta_url": "https://files.example/test_cons-all-en-{month}-00.csv"}  # ... and one file per month
+
+
+def delta_period(monkeypatch, start="2026-09", end="2026-10", months=1):  # helper: fixed period, delta mode
+    monkeypatch.setattr(bp, "ENV", "dev")                       # dev environment
+    monkeypatch.setenv("NORGESPRIS_DEV_START_MONTH", start)     # first month of the period
+    monkeypatch.setenv("NORGESPRIS_DEV_END_MONTH", end)         # last month (fixed, so the test does not depend on today)
+    monkeypatch.setattr(bp, "LOAD_MODE", "delta")               # delta mode
+    monkeypatch.setattr(bp, "DELTA_MONTHS", months)             # how many newest months at least
+
+
+def row(period, ingested="2026-11-08T10:00:00+00:00", status="ingested", dataset="test_cons"):  # helper: one manifest row
+    return {"dataset": dataset, "period": period, "status": status, "ingested_at_utc": ingested}  # the fields delta_months uses
+
+
+def test_delta_url_fills_the_month():                           # month in the data.elhub.no file name
+    cons = next(c for c in bp.SOURCES if c["dataset"] == "consumption_per_group_municipality_hour")  # the real registry entry
+    assert bp.delta_url(cons, "2026-10").endswith("consumption_per_group_municipality_hour-all-en-2026-10-00.csv")  # day 00 = whole month
+
+
+def test_delta_months_high_water_mark(monkeypatch):             # which months a delta run loads
+    delta_period(monkeypatch, start="2026-01", end="2026-10")   # period Jan-Oct 2026
+    state = {"manifest": []}                                    # nothing in landing yet
+    assert bp.delta_months(state, "test_cons") is None          # -> full load first
+
+    state["manifest"] = [row("snapshot", "2026-11-08T10:00:00+00:00")]  # full file from 8 Nov (complete up to Oct)
+    assert bp.delta_months(state, "test_cons") == ["2026-10"]   # only last month
+
+    state["manifest"] = [row("snapshot", "2026-08-20T10:00:00+00:00")]  # full file from August (complete up to July)
+    assert bp.delta_months(state, "test_cons") == ["2026-07", "2026-08", "2026-09", "2026-10"]  # the gap is filled
+
+    state["manifest"] = [row("2026-10"), row("2026-03", status="failed: HTTP 500"), row("2026-01", dataset="other")]  # month file + noise
+    assert bp.delta_months(state, "test_cons") == ["2026-10"]   # failed rows and other datasets do not count
+    monkeypatch.setattr(bp, "DELTA_MONTHS", 2)                  # always the 2 newest months
+    assert bp.delta_months(state, "test_cons") == ["2026-09", "2026-10"]  # two months
+
+
+def fake_source(calls, month_header="A;B"):                     # helper: fake download for the full and the month file
+    def download(url, target, headers=None, attempts=3):        # same signature as bp.download
+        calls.append(url)                                       # remember what was asked for
+        if url.endswith("-00.csv"):                             # a month file
+            text = f"{month_header}\r\n10;20\r\n"            # one row (header can be changed by the test)
+        else:                                                   # the full file
+            text = "A;B\r\n1;2\r\n3;4\r\n"                  # two rows
+        with open(target, "w", encoding="utf-8") as f:          # write the fake answer
+            f.write(text)                                       # as the downloaded file
+    return download                                             # the fake function
+
+
+def test_delta_run_loads_full_first_then_only_last_month(landing, monkeypatch):  # first run full, then delta
+    delta_period(monkeypatch)                                   # period Sep-Oct 2026, delta mode
+    monkeypatch.setattr(bp, "SOURCES", [ELHUB_DELTA])           # only the test source
+    calls = []                                                  # URLs asked for
+    monkeypatch.setattr(bp, "download", fake_source(calls))     # fake internet
+
+    assert bp.run_bronze()["status"] == "success"               # first run
+    assert calls == ["https://api.example/full.csv"]            # nothing in landing -> the full file
+
+    calls.clear()                                               # second run
+    assert bp.run_bronze()["status"] == "success"               # runs fine
+    assert calls == ["https://files.example/test_cons-all-en-2026-10-00.csv"]  # only the newest month of the period
+    month = [r for r in bp.read_manifest() if r["period"] == "2026-10"]  # its manifest row
+    assert month[0]["status"] == "ingested" and month[0]["original_filename"] == "test_cons_2026-10.csv"  # stored as its own file
+    assert month[0]["schema_status"] == "ok"                    # same columns as the full file
+
+
+def test_delta_falls_back_to_full_file_when_month_file_is_missing(landing, monkeypatch):  # 404 -> full file
+    delta_period(monkeypatch)                                   # delta mode
+    monkeypatch.setattr(bp, "SOURCES", [ELHUB_DELTA])           # only the test source
+    calls = []                                                  # URLs asked for
+    monkeypatch.setattr(bp, "download", fake_source(calls))     # fake internet
+    bp.run_bronze()                                             # first run: full file
+
+    def month_missing(url, target, headers=None, attempts=3):   # the month file does not exist ...
+        calls.append(url)                                       # remember the request
+        if url.endswith("-00.csv"):                             # month file
+            raise http_error(404)                               # ... 404
+        fake_source([])(url, target)                            # full file as before
+    monkeypatch.setattr(bp, "download", month_missing)          # use it
+    calls.clear()                                               # second run
+    result = bp.run_bronze()                                    # delta run
+    assert result["status"] == "success" and result["warning"] == 1  # a warning, not a failure
+    assert calls[-1] == "https://api.example/full.csv"          # the full file was downloaded instead
+    assert bp.read_manifest()[-1]["status"] == "skipped_duplicate"  # same full file as before -> not stored twice
+
+
+def test_delta_month_file_with_other_columns_is_not_used(landing, monkeypatch):  # other header -> full file
+    delta_period(monkeypatch)                                   # delta mode
+    monkeypatch.setattr(bp, "SOURCES", [ELHUB_DELTA])           # only the test source
+    calls = []                                                  # URLs asked for
+    monkeypatch.setattr(bp, "download", fake_source(calls, month_header="X;Y;Z"))  # month file has other columns
+    bp.run_bronze()                                             # first run: full file
+    result = bp.run_bronze()                                    # delta run
+    assert result["warning"] == 1                               # month file rejected
+    assert not [r for r in bp.read_manifest() if r["period"] == "2026-10" and r["status"] == "ingested"]  # never stored
+    assert calls[-1] == "https://api.example/full.csv"          # full file instead
+
+
+def test_frost_delta_requests_only_newest_months(landing, monkeypatch):  # Frost in delta mode
+    delta_period(monkeypatch, start="2025-06", end="2025-10")   # five months, delta mode
+    monkeypatch.setattr(bp, "frost_station_ids", lambda state: ["SN1"])  # one station -> one group
+    state = {"manifest": [row("2025-09", dataset="frost_observations") | {"original_filename": "x.json"}]}  # Sep already there
+    months = [m for _, m, _ in bp.frost_observation_requests(state, FROST_OBS)]  # months requested
+    assert months == ["2025-09", "2025-10"]                     # from the high-water month, not the whole period
+
+
+def test_wrong_load_mode_is_a_clear_error(landing, monkeypatch):  # typo in .env
+    monkeypatch.setattr(bp, "LOAD_MODE", "detla")               # wrong value
+    with pytest.raises(ValueError, match="NORGESPRIS_LOAD_MODE"):  # clear message ...
+        bp.run_bronze()                                         # ... before anything is downloaded

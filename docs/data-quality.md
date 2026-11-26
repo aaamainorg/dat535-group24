@@ -40,10 +40,11 @@ flowchart LR
 |---|---|---|
 | **SHA-256 of the content** (for a ZIP: the files inside) | `_manifest.csv` | a file identical to an earlier one → `skipped_duplicate`, not stored again |
 | **Header compared with the previous file** | `_manifest.csv` → `schema_status` | `first_file` / `ok` / `changed` – a schema change is kept and flagged for Silver |
-| **Download status** | `_manifest.csv` → `status` | `ingested`, `skipped_duplicate`, `no_data` (Frost 404), `warning: …` (optional source), `failed: …` (required source → stage fails) |
+| **Download status** | `_manifest.csv` → `status` | `ingested`, `skipped_duplicate`, `no_data` (Frost 404), `warning: …` (optional source, or a delta month file that could not be used → full file instead), `failed: …` (required source → stage fails) |
 | **Recent months re-downloaded** | `REDOWNLOAD_RECENT_MONTHS = 2` | MET corrects recent data; late data is picked up |
 | **Lineage on every row** | Bronze tables | `_source_file`, `_landing_run_id`, `_loaded_at` |
-| **Load only when files changed** | `bronze._load_log` | fingerprint of the newest landing files per dataset; status `loaded` / `unchanged` / `no_landing_files` / `failed` |
+| **Load only when files changed** | `bronze._load_log` | fingerprint of the newest landing files per dataset; status `loaded` / `appended` / `unchanged` / `no_landing_files` / `failed` |
+| **Delta: same columns, month files only** | landing + `bronze._load_files` | a month file must have the same header as the full file, and only month files are appended – otherwise full file / full reload |
 | **Encoding and separator detection** | `bronze_to_postgres.py` | SSB files in Latin-1 are read correctly (no broken æ, ø, å) |
 
 ## 3. Silver
@@ -124,13 +125,13 @@ run turns red. *Warnings* are logged but do not block.
 
 ## 5. Tests in CI
 
-`pytest -q tests/` (55 tests, local Spark, no database or internet needed) runs **before** every pipeline run in all workflows, after a
+`pytest -q tests/` (65 tests, local Spark, no database or internet needed) runs **before** every pipeline run in all workflows, after a
 `ruff` lint step (syntax errors, undefined names).
 
 | File | Covers |
 |---|---|
-| `tests/test_bronze.py` | file stored unchanged with metadata, duplicate skip, changed header flagged, ZIP/gzip handling, required vs optional failures, no retry on 4xx, `.env` loading, Frost login / request grouping / 404 = no data, period settings |
-| `tests/test_postgres.py` | database name per environment, Bronze reload only when landing files change, clear error without password |
+| `tests/test_bronze.py` | file stored unchanged with metadata, duplicate skip, changed header flagged, ZIP/gzip handling, required vs optional failures, no retry on 4xx, `.env` loading, Frost login / request grouping / 404 = no data, period settings, **delta load** (high-water mark, first run full, fallback on 404 or other columns, Frost months, wrong load mode) |
+| `tests/test_postgres.py` | database name per environment, Bronze reload only when landing files change, clear error without password, which tables are appended, files since the newest full load, only month files appended |
 | `tests/test_silver.py` | every cleaning function and reject rule, newest version per key, local dates, municipality matching, county average, county/price area, **distribution key** |
 | `tests/test_gold.py` | dimensions, no kWh lost, unique grain, no orphan keys, population fallback, private split, and the temperature adjustment on data with a **known answer** (+10 %) |
 
@@ -158,6 +159,9 @@ FROM silver.rejects GROUP BY dataset, rule_id ORDER BY n DESC;
 
 -- Bronze: what was loaded when
 SELECT dataset, status, rows, loaded_at FROM bronze._load_log ORDER BY loaded_at DESC LIMIT 20;
+
+-- Bronze (delta): which landing files are in each table
+SELECT dataset, load_type, loaded_at, landing_file FROM bronze._load_files ORDER BY loaded_at DESC LIMIT 20;
 ```
 
 Landing: `python scripts/manifest_summary.py /tmp/norgespris-landing/dev/_manifest.csv` prints the newest run as a table.

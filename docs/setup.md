@@ -111,6 +111,8 @@ cp env.example .env                                    # then edit .env
 | `FROST_CLIENT_SECRET` | no | | kept for reference; not sent by the pipeline |
 | `NORGESPRIS_DEV_START_MONTH` / `_END_MONTH` | **yes** | `2024-01` / *(empty)* | dev period (`YYYY-MM`, empty end = last complete month) – for Frost **and** Silver |
 | `NORGESPRIS_PROD_START_MONTH` / `_END_MONTH` | **yes** | `2024-01` / *(empty)* | prod period |
+| `NORGESPRIS_LOAD_MODE` | no | `delta` (default) / `full` | delta = after the first full load only the newest month of the time series; full = whole files every run |
+| `NORGESPRIS_DELTA_MONTHS` | no | `1` | delta: how many of the newest months are always (re)loaded |
 | `NORGESPRIS_LANDING_ROOT` | no | `/tmp/norgespris-landing` | raw files; `dev/` or `prod/` is added |
 | `NORGESPRIS_PG_HOST`, `_PORT`, `_USER` | no | `localhost`, `5432`, `norgespris` | PostgreSQL connection |
 | `NORGESPRIS_PG_PASSWORD` | **yes** | | the password from step 5 |
@@ -183,6 +185,7 @@ All workflows use `runs-on: self-hosted`: they run on **your** machine, where Po
    |---|---|
    | `NORGESPRIS_DEV_START_MONTH` / `_END_MONTH` | `2026-10` / `2026-10` (set these, e.g. `2025-01` / empty, for meaningful Gold in dev) |
    | `NORGESPRIS_PROD_START_MONTH` / `_END_MONTH` | `2024-01` / empty |
+   | `NORGESPRIS_LOAD_MODE` | `delta` |
    | `NORGESPRIS_PG_HOST`, `_PORT`, `_USER` | `localhost`, `5432`, `norgespris` |
    | `NORGESPRIS_SPARK_DRIVER_MEMORY` | `2g` |
 
