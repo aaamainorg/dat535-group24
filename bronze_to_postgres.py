@@ -8,6 +8,10 @@ GENERATED from the code cells marked for PostgreSQL in notebooks/01_bronze.ipynb
 this file is what GitHub Actions runs. Settings and password: .env / environment
 (NORGESPRIS_PG_HOST, _PORT, _USER, _PASSWORD, _DATABASE, _JDBC_JAR).
 
+Delta load (NORGESPRIS_LOAD_MODE=delta): time-series tables only get the landing
+files that are not in them yet (appended); bronze._load_files records which files
+each table holds. Other tables, and the first load, replace the whole table.
+
 Usage:
     python run_pipeline.py postgres    (recommended; after "bronze" has filled the landing folder)
     python bronze_to_postgres.py
@@ -17,7 +21,7 @@ import logging                                                  # log messages
 import os                                                       # environment variables and paths
 
 # Same settings and source registry as the landing ingestion (this also reads .env):
-from bronze_pipeline import ENV, LANDING_DIR, MANIFEST_PATH, SOURCES  # noqa: F401
+from bronze_pipeline import ENV, LANDING_DIR, MANIFEST_PATH, SOURCES, LOAD_MODE  # noqa: F401
 
 spark = None                                                    # set by run_bronze_to_postgres()
 manifest = None                                                 # set by run_bronze_to_postgres()
@@ -97,9 +101,10 @@ def guess_encoding(path):                                       # text encoding 
             return "UTF-8"                                      # the file is still UTF-8
         return "ISO-8859-1"                                     # bytes that are not UTF-8 -> Latin-1 (Norwegian letters = 1 byte)
 
-def read_bronze(cfg):                                           # read a CSV dataset from landing
-    """Read a Bronze CSV dataset with Spark, all columns as text; None if nothing to read."""
-    files = newest_files(cfg["dataset"])                        # which files/folders to read
+def read_bronze(cfg, files=None):                               # read a CSV dataset from landing
+    """Read a Bronze CSV dataset with Spark, all columns as text; None if nothing to read.
+    files: read only these (delta load); default = the newest version of every file of the dataset."""
+    files = newest_files(cfg["dataset"]) if files is None else files  # which files/folders to read
     if not files or cfg["sep"] is None:                         # nothing ingested, or JSON (Frost -> 4.5)
         return None                                             # nothing to read here
     sep = guess_sep(cfg["dataset"], cfg["sep"])                 # Elhub's ZIP may use another separator than our samples
@@ -123,9 +128,9 @@ def read_bronze(cfg):                                           # read a CSV dat
     return result                                               # one DataFrame with all files
 
 
-def read_frost(dataset):                                        # read a Frost JSON dataset from landing
-    """Read all newest Frost JSON files of a dataset with Spark and explode the 'data' list into rows."""
-    files = newest_files(dataset)                               # all JSON files of the dataset
+def read_frost(dataset, files=None):                            # read a Frost JSON dataset from landing
+    """Read all newest Frost JSON files of a dataset (or only `files`) with Spark and explode 'data' into rows."""
+    files = newest_files(dataset) if files is None else files   # all JSON files of the dataset (or the given ones)
     if not files:                                               # no files stored
         print(f"-- {dataset}: nothing in landing yet (is FROST_CLIENT_ID set?)")  # say why
         return None                                             # nothing to read
@@ -195,11 +200,55 @@ def read_load_log():                                            # what was loade
     return dict(zip(newest.dataset, newest.fingerprint))        # dataset -> fingerprint
 
 
-def load_dataset(cfg, last_fingerprints):                       # load one dataset into bronze
-    """Load one dataset from landing into bronze.<dataset>; returns a dict for the load log."""
+def has_delta(cfg):                                             # is this dataset loaded month by month in delta mode?
+    """True for the time series that landing stores as monthly files (Elhub with delta_url, Frost observations)."""
+    return bool(cfg.get("delta_url")) or cfg["mode"] == "frost_observations"  # the rest are small full files
+
+
+def files_since_full_load(log):                                 # which landing files are in each bronze table now
+    """From the rows of bronze._load_files: per dataset the files of its newest full load + every append after it."""
+    loaded = {}                                                 # dataset -> set of landing file paths
+    for dataset, rows in log.groupby("dataset"):                # one dataset at a time
+        full = rows[rows.load_type == "full"].loaded_at         # times of its full loads
+        since = full.max() if not full.empty else ""            # newest full load ('' = none -> every row counts)
+        loaded[dataset] = set(rows[rows.loaded_at >= since].landing_file)  # files written since then
+    return loaded                                               # e.g. {'frost_observations': {'/tmp/...json', ...}}
+
+
+def read_loaded_files():                                        # what is already in the bronze tables
+    """Files already loaded into each bronze table, from bronze._load_files ({} before the first load)."""
+    try:                                                        # the table may not exist yet
+        log = pg_query("SELECT dataset, landing_file, load_type, loaded_at FROM bronze._load_files").toPandas()  # small table
+    except Exception as e:                                      # the table does not exist before the first load
+        if "does not exist" in str(e):                          # first load with delta support
+            return {}                                           # nothing known -> full loads
+        raise                                                   # other errors (wrong password, no server) -> stop
+    return files_since_full_load(log)                           # dataset -> files
+
+
+def is_month_file(path):                                        # a delta file (stored under a month folder)?
+    """True for landing files under .../<dataset>/2026-10/..., False for full files (.../snapshot/...)."""
+    period = os.path.basename(os.path.dirname(path))            # the folder above the file = its period
+    return len(period) == 7 and period[4] == "-"                # 'YYYY-MM' = one month
+
+
+def table_columns(table):                                       # column names of a table in PostgreSQL
+    """Column names of an existing table, None if the table does not exist."""
+    try:                                                        # LIMIT 0 = only the column names, no rows
+        return pg_query(f"SELECT * FROM {table} LIMIT 0").columns  # Spark reads the schema of the result
+    except Exception as e:                                      # e.g. the table was dropped by hand
+        if "does not exist" in str(e):                          # table missing
+            return None                                         # -> the caller does a full load
+        raise                                                   # other errors -> stop
+
+
+def load_dataset(cfg, last_fingerprints, loaded_files=None):    # load one dataset into bronze
+    """Load one dataset from landing into bronze.<dataset>; returns a dict for the load logs.
+    Delta mode: only landing files that are not in the table yet are appended (loaded_files = what is in it)."""
     dataset = cfg["dataset"]                                    # dataset name
     table = f"bronze.{dataset}"                                 # target table
-    result = {"dataset": dataset, "table": table, "status": "", "fingerprint": "", "rows": 0}  # result row for the load log
+    result = {"dataset": dataset, "table": table, "status": "", "fingerprint": "", "rows": 0,  # result row for the load log ...
+              "files": [], "load_type": ""}                     # ... + which files were written (for bronze._load_files)
     fingerprint = bronze_fingerprint(dataset)                   # which landing files would be loaded
     if fingerprint is None:                                     # nothing in landing (e.g. optional source)
         result["status"] = "no_landing_files"                   # nothing in landing
@@ -208,11 +257,31 @@ def load_dataset(cfg, last_fingerprints):                       # load one datas
     if last_fingerprints.get(dataset) == fingerprint:           # same files as last time
         result["status"] = "unchanged"                          # nothing changed
         return result                                           # skip: no need to reload
-    df = read_bronze(cfg) if cfg["sep"] is not None else read_frost(dataset)  # CSV or JSON reader from section 4
+
+    def read(files):                                            # CSV or JSON reader from section 4
+        return read_bronze(cfg, files) if cfg["sep"] is not None else read_frost(dataset, files)  # only these files
+
+    files = newest_files(dataset)                               # every newest landing file of the dataset
+    done = (loaded_files or {}).get(dataset)                    # files already in the table (None = not known)
+    if LOAD_MODE == "delta" and has_delta(cfg) and done:        # delta: try to append only the new files
+        new = [f for f in files if f not in done]               # e.g. the file of last month
+        only_months = bool(new) and all(is_month_file(f) for f in new)  # a new FULL file must replace the table, not be added
+        columns = table_columns(table) if only_months else None  # columns of the existing table
+        if columns is not None:                                 # there are new files and the table exists
+            df = add_lineage(to_postgres_types(read(new)))      # text columns + lineage, new files only
+            if set(df.columns) == set(columns):                 # same columns -> appending is safe
+                result["rows"] = df.count()                     # rows in the new files
+                write_table(df.select(*columns), table, mode="append")  # add them (same column order as the table)
+                result.update(status="appended", files=new, load_type="delta")  # remember what was added
+                pg_logger.info(f"  {table}: +{result['rows']:,} rows from {len(new)} new file(s)")  # log the delta
+                return result                                   # done: older rows stay as they are
+        pg_logger.info(f"  {table}: cannot append (a new full file, no table or new columns) -> full reload")  # explain
+
+    df = read(files)                                            # CSV or JSON reader from section 4
     df = add_lineage(to_postgres_types(df))                     # text columns + lineage
     write_table(df, table)                                      # replace the table
     result["rows"] = pg_query(f"SELECT COUNT(*) AS n FROM {table}").first()["n"]  # rows that arrived in Postgres
-    result["status"] = "loaded"                                 # loaded
+    result.update(status="loaded", files=files, load_type="full")  # loaded (all newest files)
     pg_logger.info(f"  {table}: {result['rows']:,} rows")       # log the row count
     return result                                               # result for the load log
 
@@ -228,11 +297,13 @@ def run_bronze_to_postgres():                                   # the whole post
     manifest = pd.read_csv(MANIFEST_PATH, dtype=str).fillna("") # newest manifest (landing may just have run)
     pg_logger.info(f"Loading landing files into the bronze schema of {PG_URL}")  # log where we write
     last = read_load_log()                                      # what was loaded last time
+    loaded_files = read_loaded_files()                          # which landing files are in the tables (for delta)
+    pg_logger.info(f"Load mode: {LOAD_MODE}")                   # delta = append new files, full = replace tables
     loaded_at = datetime.now(timezone.utc).isoformat(timespec="seconds")  # one timestamp for this load
     results, failed = [], 0                                     # results and number of failures
     for cfg in SOURCES:                                         # same order as the registry
         try:                                                    # one failing dataset must not stop the others
-            results.append(load_dataset(cfg, last))             # load and remember the result
+            results.append(load_dataset(cfg, last, loaded_files))  # load and remember the result
         except Exception as e:                                  # keep going, but remember the failure
             pg_logger.error(f"  bronze.{cfg['dataset']}: {type(e).__name__}: {str(e)[:300]}")  # log the error (shortened)
             results.append({"dataset": cfg["dataset"], "table": f"bronze.{cfg['dataset']}",  # result row for the failure ...
@@ -240,9 +311,15 @@ def run_bronze_to_postgres():                                   # the whole post
             failed += 1 if cfg["required"] else 0               # optional datasets do not fail the stage
 
     write_table(spark.createDataFrame(manifest), "bronze.manifest")  # the manifest as a table (replaced each run)
-    done = [dict(r, loaded_at=loaded_at) for r in results if r["status"] == "loaded"]  # rows of the loaded datasets
+    log_cols = ("dataset", "table", "status", "fingerprint", "rows")  # the columns of bronze._load_log
+    done = [dict({c: r[c] for c in log_cols}, loaded_at=loaded_at)  # one log row per dataset ...
+            for r in results if r["status"] in ("loaded", "appended")]  # ... that was loaded or appended
     if done:                                                    # remember what was loaded (append = history)
         write_table(spark.createDataFrame(pd.DataFrame(done)), "bronze._load_log", mode="append")  # append to the load history
+    files = [{"dataset": r["dataset"], "landing_file": f, "load_type": r["load_type"], "loaded_at": loaded_at}  # one row ...
+             for r in results if r.get("files") for f in r["files"]]  # ... per landing file written this run
+    if files:                                                   # remember which files are in the tables (for delta)
+        write_table(spark.createDataFrame(pd.DataFrame(files)), "bronze._load_files", mode="append")  # append = history
 
     elapsed = time.time() - start_time                          # run time in seconds
     counts = pd.Series([r["status"].split(":")[0] for r in results]).value_counts().to_dict()  # count the results by status

@@ -60,3 +60,29 @@ def test_missing_or_placeholder_password_fails_clearly(monkeypatch):  # no passw
     for password in ("", "your-postgres-password"):             # empty and placeholder
         module = reload_with(monkeypatch, NORGESPRIS_PG_PASSWORD=password)  # settings with that password
         assert module.run_bronze_to_postgres()["status"] == "failed"     # stops before starting Spark
+
+
+def test_delta_datasets_are_the_time_series():                  # which tables can be appended to
+    module = importlib.import_module("bronze_to_postgres")      # the module as it is
+    delta = {c["dataset"] for c in module.SOURCES if module.has_delta(c)}  # datasets loaded month by month
+    assert delta == {"consumption_per_group_municipality_hour",            # Elhub hourly consumption
+                     "norgespris_count_per_municipality_consumption_group",  # Norgespris meters per municipality
+                     "frost_observations"}                                 # daily temperature
+
+
+def test_files_since_full_load():                               # what is already in a bronze table
+    log = pd.DataFrame([                                        # bronze._load_files as a small table:
+        {"dataset": "d", "landing_file": "old.csv", "load_type": "full", "loaded_at": "2026-10-01T00:00:00+00:00"},   # old full load
+        {"dataset": "d", "landing_file": "a.csv", "load_type": "full", "loaded_at": "2026-11-01T00:00:00+00:00"},     # newest full load
+        {"dataset": "d", "landing_file": "m10.csv", "load_type": "delta", "loaded_at": "2026-11-06T00:00:00+00:00"},  # appended after it
+        {"dataset": "e", "landing_file": "e.json", "load_type": "full", "loaded_at": "2026-11-01T00:00:00+00:00"},    # another dataset
+    ])                                                          # end of the rows
+    loaded = pg.files_since_full_load(log)                      # files per dataset
+    assert loaded == {"d": {"a.csv", "m10.csv"}, "e": {"e.json"}}  # old.csv was replaced by the newest full load
+
+
+def test_only_month_files_are_appended():                       # full files replace the table
+    assert pg.is_month_file("/tmp/l/dev/elhub/d/2026-10/20261107T060000Z__d_2026-10.csv")  # a month file
+    assert pg.is_month_file("/tmp/l/dev/elhub/d/2026-10/20261107T060000Z__d_2026-10_unzipped")  # its unpacked ZIP folder
+    assert not pg.is_month_file("/tmp/l/dev/elhub/d/snapshot/20261107T060000Z__d.zip")  # a full file
+    assert not pg.is_month_file("/tmp/l/dev/met/d/manual/20261107T060000Z__x.csv")  # a manual file

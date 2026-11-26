@@ -10,6 +10,10 @@ notebook cell and copy it here, so the two stay identical.
 
 Credentials: FROST_CLIENT_ID from .env (repo root) or from the environment.
 
+Load mode (NORGESPRIS_LOAD_MODE in .env): "delta" (default) downloads only the
+newest complete month(s) of the time series after the first full load; "full"
+downloads the whole files every run (the old behaviour).
+
 Usage:
     python run_pipeline.py bronze      (recommended)
     python bronze_pipeline.py
@@ -67,6 +71,8 @@ MANIFEST_PATH = os.path.join(LANDING_DIR, "_manifest.csv")    # one line per fil
 
 REDOWNLOAD_RECENT_MONTHS = 2                                  # always re-fetch the newest months (MET corrects recent data)
 FROST_STATIONS_PER_REQUEST = 100                              # stations per observations request (keeps answers small)
+LOAD_MODE = os.environ.get("NORGESPRIS_LOAD_MODE", "delta").strip().lower()  # "delta" = only new months, "full" = whole files
+DELTA_MONTHS = int(os.environ.get("NORGESPRIS_DELTA_MONTHS", "1"))  # delta: always (re)load at least this many newest months
 
 
 def month_range():                                              # the period for dev or prod from .env
@@ -99,15 +105,19 @@ SSB_URL = ("https://data.ssb.no/api/pxwebapi/v2/tables/07459/data?lang=no"      
 
 SOURCES = [                                                                    # the datasets the pipeline handles
     {"source": "elhub", "dataset": "consumption_per_group_municipality_hour",  # hourly kWh per municipality and group
-     "mode": "snapshot", "sep": ";", "required": True,                         # .csv export = last ~3 years, no date filter
-     "url": ELHUB_API + "/municipalities.csv?dataset=CONSUMPTION_PER_GROUP_MUNICIPALITY_HOUR"},  # Elhub API, CSV export (a ZIP)
+     "mode": "snapshot", "sep": ";", "required": True,                         # full: .csv export = last ~3 years
+     "url": ELHUB_API + "/municipalities.csv?dataset=CONSUMPTION_PER_GROUP_MUNICIPALITY_HOUR",  # Elhub API, CSV export (a ZIP)
+     "delta_url": "https://data.elhub.no/download/consumption_per_group_municipality_hour/"  # delta: Elhub's file ...
+                  "consumption_per_group_municipality_hour-all-en-{month}-00.csv"},  # ... of one month (00 = all days)
     {"source": "elhub", "dataset": "norgespris_consumption_per_group_eac_mba", # kWh with/without Norgespris per price area
      "mode": "snapshot", "sep": ",", "required": False,         # comma-separated, optional dataset
-     "url": ELHUB_API + "/price-areas.csv?dataset=NORGESPRIS_CONSUMPTION_PER_GROUP_EAC_MBA"},  # Elhub API, price-area export
+     "url": ELHUB_API + "/price-areas.csv?dataset=NORGESPRIS_CONSUMPTION_PER_GROUP_EAC_MBA"},  # Elhub API, price-area export (small: always full)
     {"source": "elhub", "dataset": "norgespris_count_per_municipality_consumption_group",  # Norgespris meters per municipality
      "mode": "snapshot", "sep": ",", "required": False,         # comma-separated, optional dataset
      "url": "https://data.elhub.no/download/norgespris_count_per_municipality_consumption_group/"  # data.elhub.no download ...
-            "norgespris_count_per_municipality_consumption_group-all-en-0000-00-00.csv"},  # ... the 'all' file (all days so far)
+            "norgespris_count_per_municipality_consumption_group-all-en-0000-00-00.csv",  # ... the 'all' file (all days so far)
+     "delta_url": "https://data.elhub.no/download/norgespris_count_per_municipality_consumption_group/"  # delta: the file ...
+                  "norgespris_count_per_municipality_consumption_group-all-en-{month}-00.csv"},  # ... of one month (00 = all days)
     {"source": "ssb", "dataset": "population_07459",                          # population per municipality
      "mode": "snapshot", "sep": ";", "required": True, "url": SSB_URL},  # semicolon CSV, required
     {"source": "met", "dataset": "frost_stations",                            # 1) station -> municipality
@@ -213,6 +223,33 @@ def last_complete_month(today=None):                            # the newest mon
     return f"{y:04d}-{m:02d}"                                   # back to 'YYYY-MM'
 
 
+def delta_url(cfg, month):                                      # the URL of one month of a source
+    """'...-all-en-{month}-00.csv' -> '...-all-en-2026-10-00.csv' (data.elhub.no: day 00 = the whole month)."""
+    return cfg["delta_url"].format(month=month)                 # fill in the month
+
+
+def month_loaded(row):                                          # newest complete month a manifest row covers
+    """The month of a monthly file; for a full file the last complete month on the day it was downloaded."""
+    if len(row["period"]) == 7 and row["period"][4] == "-":     # a monthly file: its period is 'YYYY-MM'
+        return row["period"]                                    # e.g. '2026-10'
+    return last_complete_month(date.fromisoformat(row["ingested_at_utc"][:10]))  # full file: complete up to the month before
+
+
+def delta_months(state, dataset):                               # months a delta run (re)loads for a dataset
+    """Months from the newest month already in landing to the end of the period (at least the last DELTA_MONTHS).
+    None = nothing in landing yet -> the caller does a full load first."""
+    start, end = month_range()                                  # the period from .env
+    months = month_list(start, end or last_complete_month())    # every month of the period
+    loaded = [r for r in state["manifest"] if r["dataset"] == dataset  # earlier files of this dataset ...
+              and r["status"] in ("ingested", "skipped_duplicate", "no_data")]  # ... that are in landing (or known empty)
+    if not loaded or not months:                                # first run (or an empty period) ...
+        return None                                             # ... -> full load
+    newest = max(month_loaded(r) for r in loaded)               # high-water mark: the newest month we already have
+    last_n = months[-max(1, min(DELTA_MONTHS, len(months)))]    # first of the last DELTA_MONTHS months of the period
+    first = min(newest, last_n)                                 # reload the high-water month too (sources correct recent data)
+    return [m for m in months if m >= first]                    # e.g. ['2026-10'] in November 2026
+
+
 def gunzip_if_needed(path):                                     # undo gzip compression of a downloaded file
     """If the file is gzip-compressed, replace it with the unpacked content."""
     with open(path, "rb") as f:                                 # look at the first two bytes
@@ -303,8 +340,10 @@ def ingest_file(state, src_path, source, dataset, period, origin, original_filen
     state["manifest"].append(row)                               # and remember it for the rest of the run
 
 
-def download_and_ingest(state, cfg, url, period, filename):     # download one file, then ingest it
-    """Download url to a temp file and ingest it; record every outcome in the manifest."""
+def download_and_ingest(state, cfg, url, period, filename, delta=False):  # download one file, then ingest it
+    """Download url to a temp file and ingest it; record every outcome in the manifest.
+    Returns "stored", "no_data", "failed" or - only for a month file (delta=True) that is missing (400/404)
+    or has other columns than the full file - "rejected", so the caller can download the full file instead."""
     source, dataset = cfg["source"], cfg["dataset"]             # names for the manifest and folders
     level = "failed" if cfg["required"] else "warning"           # how bad a failure is for this source
     base_row = {"run_id": state["run_id"], "env": ENV, "source": source, "dataset": dataset,  # manifest row for failures ...
@@ -315,11 +354,20 @@ def download_and_ingest(state, cfg, url, period, filename):     # download one f
         state["counts"][level] += 1                             # count the failure
         append_manifest(dict(base_row, status=f"{level}: FROST_CLIENT_ID missing (set it in .env)"))  # record it in the manifest
         logger.error(f"  {level.upper()}: {dataset} needs FROST_CLIENT_ID (in .env or as GitHub secret)")  # explain how to fix it
-        return                                                  # nothing to download
+        return "failed"                                         # nothing to download
     tmp_path = os.path.join(state["tmp_dir"], filename)          # arrives in <landing>/_incoming/<run_id>/ first
+    outcome = "failed"                                          # changed below when it works
     try:                                                        # download + store; errors handled below
         download(url, tmp_path, headers)                         # may raise after failed attempts
+        if delta:                                               # a month file must have the same columns as the full file
+            earlier = [r for r in state["manifest"] if r["dataset"] == dataset and r["status"] == "ingested"]  # stored files
+            if earlier and earlier[-1]["header"] != read_header(tmp_path):  # other columns (or separator) -> do not mix them
+                state["counts"]["warning"] += 1                 # a warning: the caller loads the full file instead
+                append_manifest(dict(base_row, status="warning: delta file has other columns - full download instead"))  # record it
+                logger.warning(f"  delta file {filename} has other columns than the full file - full download instead")  # explain
+                return "rejected"                               # (the finally block below still deletes the temp file)
         ingest_file(state, tmp_path, source, dataset, period, url, filename)  # checks + copy + manifest
+        outcome = "stored"                                      # in landing now (or a duplicate of a stored file)
     except urllib.error.HTTPError as e:                         # the server answered with an error
         if e.code == 404 and cfg["mode"] == "frost_observations":  # Frost: "no data for these stations/month"
             state["counts"]["no_data"] += 1                     # count 'no data'
@@ -327,6 +375,12 @@ def download_and_ingest(state, cfg, url, period, filename):     # download one f
             append_manifest(row)                                # write it to the manifest file
             state["manifest"].append(row)                        # remember: do not ask again (unless recent)
             logger.info(f"  no data: {filename}")               # log it (not an error)
+            outcome = "no_data"                                 # tell the caller
+        elif delta and e.code in (400, 404):                    # month filter not accepted / month file not there
+            state["counts"]["warning"] += 1                     # a warning, not a failure: the caller loads the full file
+            append_manifest(dict(base_row, status=f"warning: delta HTTP {e.code} - full download instead"))  # record it
+            logger.warning(f"  delta not available (HTTP {e.code}): {url} - downloading the full file instead")  # explain
+            outcome = "rejected"                                # tell the caller
         else:                                                   # any other HTTP error
             state["counts"][level] += 1                         # count the failure
             append_manifest(dict(base_row, status=f"{level}: HTTP {e.code} {e.reason}"[:200]))  # record it in the manifest (max 200 chars)
@@ -338,6 +392,7 @@ def download_and_ingest(state, cfg, url, period, filename):     # download one f
     finally:                                                    # runs in every case
         if os.path.exists(tmp_path):                             # always clean up the temp file
             os.remove(tmp_path)                                 # delete the temp file
+    return outcome                                              # "stored", "no_data", "rejected" or "failed"
 
 
 def frost_station_ids(state):                                   # stations that have daily mean temperature
@@ -364,6 +419,8 @@ def frost_observation_requests(state, cfg):                     # all Frost obse
     layout = hashlib.sha256(",".join(ids).encode("utf-8")).hexdigest()[:12]  # id of this station grouping (in file names)
     start, end = month_range()                                   # period for dev or prod, from .env
     months = month_list(start, end or last_complete_month())     # None = up to the last complete month
+    if LOAD_MODE == "delta":                                     # delta: only the newest month(s) ...
+        months = delta_months(state, cfg["dataset"]) or months   # ... (None on the first run -> the whole period)
     recent = set(months[-REDOWNLOAD_RECENT_MONTHS:])             # always re-request the newest months
     have = {r["original_filename"] for r in state["manifest"]    # files we already got (or know are empty)
             if r["dataset"] == cfg["dataset"] and r["status"] in ("ingested", "skipped_duplicate", "no_data")}  # ... of this dataset
@@ -389,16 +446,30 @@ def run_bronze():                                               # the whole land
              "tmp_dir": os.path.join(LANDING_DIR, "_incoming", run_id),  # downloads arrive here first
              "manifest": read_manifest(),                      # everything ingested in earlier runs
              "counts": {"ingested": 0, "skipped_duplicate": 0, "no_data": 0, "warning": 0, "failed": 0}}  # outcome counters
+    if LOAD_MODE not in ("full", "delta"):                      # only two allowed values
+        raise ValueError(f"NORGESPRIS_LOAD_MODE must be 'full' or 'delta', got '{LOAD_MODE}'")  # clear message
     os.makedirs(state["tmp_dir"], exist_ok=True)                # create the temp download folder
-    logger.info(f"Landing run {run_id} (env={ENV}) -> {LANDING_DIR}")  # log the start
+    logger.info(f"Landing run {run_id} (env={ENV}, load mode={LOAD_MODE}) -> {LANDING_DIR}")  # log the start
 
     for cfg in SOURCES:                                        # one dataset at a time, in registry order
         source, dataset, mode = cfg["source"], cfg["dataset"], cfg["mode"]  # settings of this dataset
         logger.info(f"[{source}/{dataset}] mode={mode}")        # log which dataset
         ext = cfg.get("ext", "csv")                            # file extension (Frost gives JSON)
 
-        if mode == "snapshot":                                 # one file with everything
-            download_and_ingest(state, cfg, cfg["url"], "snapshot", f"{dataset}.{ext}")  # download the whole file
+        if mode == "snapshot":                                 # one file with everything (or one per month in delta)
+            months = None                                      # None = download the whole file
+            if LOAD_MODE == "delta" and cfg.get("delta_url"):  # delta, and the source can give one month
+                months = delta_months(state, dataset)          # None on the first run -> full load first
+            if months is None:                                 # full mode, no month filter, or first run
+                download_and_ingest(state, cfg, cfg["url"], "snapshot", f"{dataset}.{ext}")  # download the whole file
+            else:                                              # delta: one request per month
+                logger.info(f"  delta months: {months}")        # which months are (re)loaded
+                for month in months:                           # usually just last month
+                    outcome = download_and_ingest(state, cfg, delta_url(cfg, month), month,  # one month ...
+                                                  f"{dataset}_{month}.{ext}", delta=True)  # ... stored as its own file
+                    if outcome == "rejected":                  # month file missing or with other columns
+                        download_and_ingest(state, cfg, cfg["url"], "snapshot", f"{dataset}.{ext}")  # -> whole file instead
+                        break                                  # the whole file has every month
         elif mode == "frost_observations":                     # many small requests
             if auth_headers(cfg) is None:                      # no login -> one clear failure, not hundreds
                 download_and_ingest(state, cfg, cfg["url"], "-", "frost_obs.json")  # records one clear failure

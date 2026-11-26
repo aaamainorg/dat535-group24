@@ -42,6 +42,7 @@ cd ~/dat535-group24
 
 python run_pipeline.py all                      # bronze -> postgres -> silver -> gold (dev by default)
 python run_pipeline.py bronze                   # only download new raw files into the landing folder
+NORGESPRIS_LOAD_MODE=full python run_pipeline.py all  # whole files instead of only the newest month (default: delta)
 python run_pipeline.py postgres                 # only (re)load landing files into the bronze schema
 python run_pipeline.py silver                   # only rebuild silver from bronze
 python run_pipeline.py gold                     # only rebuild, check and publish gold from silver
@@ -55,13 +56,39 @@ and show the results.
 
 | Stage | Reads | Writes | Re-run behaviour | Fails when | Typical time (full period) |
 |---|---|---|---|---|---|
-| **bronze** (`bronze_pipeline.run_bronze`) | Elhub, SSB, Frost APIs; `_manual/` folder | files in `/tmp/norgespris-landing/<env>/`, `_manifest.csv` | files with a known checksum are skipped; the newest 2 Frost months are fetched again | a **required** source cannot be downloaded (optional ones only warn) | 5–20 min (first run), minutes after |
-| **postgres** (`bronze_to_postgres.run_bronze_to_postgres`) | newest landing files + manifest | `bronze.<dataset>`, `bronze.manifest`, `bronze._load_log` | a table is only reloaded when its landing files changed (fingerprint) | a required dataset cannot be loaded; password missing | 2–10 min |
+| **bronze** (`bronze_pipeline.run_bronze`) | Elhub, SSB, Frost APIs; `_manual/` folder | files in `/tmp/norgespris-landing/<env>/`, `_manifest.csv` | files with a known checksum are skipped; the newest 2 Frost months are fetched again; **delta:** only the newest month of the time series (below) | a **required** source cannot be downloaded (optional ones only warn) | 5–20 min (first run), minutes after |
+| **postgres** (`bronze_to_postgres.run_bronze_to_postgres`) | newest landing files + manifest | `bronze.<dataset>`, `bronze.manifest`, `bronze._load_log`, `bronze._load_files` | a table is only reloaded when its landing files changed (fingerprint); **delta:** new month files are appended (`bronze._load_files`) | a required dataset cannot be loaded; password missing | 2–10 min |
 | **silver** (`silver_pipeline.run_silver`) | `bronze.*` | `silver.*`, `silver.rejects` (replaced), `silver.quality_metrics` (appended) | full rebuild | required Bronze table missing; **duplicate keys > 0** | ≈ 10 min |
 | **gold** (`gold_pipeline.run_gold`) | `silver.*` | `gold_stage.*` → `gold.*` (+ `gold_previous.*`), `gold.publish_log`, `gold.check_results`, `_gold_summary.md` | full rebuild; published only if all error checks pass | required Silver table missing; an **error check** fails; publishing fails | ≈ 1.5 min |
 
 **Period:** Frost downloads and all Silver tables cover `NORGESPRIS_<ENV>_START_MONTH` … `_END_MONTH` (empty end = last complete month).
-Elhub and SSB always deliver their whole files (Elhub: ~3 rolling years).
+
+### Full and delta load
+
+`NORGESPRIS_LOAD_MODE` (`.env` or repository variable) decides how much is downloaded and loaded:
+
+| | `delta` (default) | `full` |
+|---|---|---|
+| First run (nothing in landing for a dataset) | full files | full files |
+| Later runs – Elhub consumption, Norgespris counts | only the **newest complete month**: Elhub's month file on data.elhub.no (`…-all-en-2026-10-00.csv`) | the whole file again (~3 years for consumption) |
+| Later runs – Frost observations | only the newest month(s) | every month of the period that is missing + the 2 newest |
+| SSB population, Norgespris per price area, Frost station lists | full file (small; unchanged → skipped by checksum) | full file |
+| `postgres` stage, time-series tables | new month files are **appended** (`bronze._load_files` records what is in each table) | table replaced when its files changed |
+| Silver, Gold | full rebuild from Bronze (unchanged) | full rebuild |
+
+**Which months a delta run loads** – a *high-water mark* read from the manifest: the newest month already in landing (a month file
+covers its month; a full file covers up to the month before the day it was downloaded). The run loads every month from that month to
+the end of the period, and at least the last `NORGESPRIS_DELTA_MONTHS` (default 1). So the high-water month is loaded once more (Elhub
+and MET correct recent data), and if the pipeline did not run for a while, the missing months are filled in automatically.
+
+**Safety nets** (the run stays green, the manifest shows a `warning: …` row):
+* month file missing (HTTP 400/404, e.g. before Elhub publishes it on the 6th) → the full file is downloaded instead;
+* month file with **other columns** than the full file → not stored (two layouts in one Bronze table would break Silver) → full file instead;
+* a new **full** file in landing (e.g. after `/tmp` was cleaned) → the Bronze table is **replaced**, never appended to.
+
+Why Silver and Gold stay full rebuilds: they are small after the daily aggregation (minutes), the temperature model needs the whole
+before-period anyway, and Silver already keeps only the newest version per key – so a month that was loaded twice into Bronze
+(original + correction) gives exactly one row in Silver.
 
 **Gold publishing step by step:**
 
@@ -108,13 +135,13 @@ All three workflows run on the **self-hosted runner** (your machine, see [setup.
 |---|---|---|---|---|---|
 | `norgespris-dev.yml` – *Dev Pipeline* | push to any `dev_*` branch (`dev_silver`, `dev_gold`, …); manual | `dev` | dev | lint → tests → `all` | group `norgespris-dev` |
 | `norgespris-prod.yml` – *Production Pipeline* | push to `main` (after a reviewed PR); manual with a **stage** choice (`all`, `bronze`, `postgres`, `silver`, `gold`) | `main` (required reviewers → approval click) | prod | lint → tests → chosen stage | group `norgespris-prod` |
-| `pipeline.yml` – *Pipeline* (scheduled) | **monthly, 5th at 06:00 UTC** (`0 6 5 * *`); manual | `main` | prod | lint → tests → `all` | group `norgespris-prod` (never overlaps prod) |
+| `pipeline.yml` – *Pipeline* (scheduled) | **monthly, 7th at 06:00 UTC** (`0 6 7 * *` – Elhub publishes last month's file on the 6th); manual | `main` | prod | lint → tests → `all` | group `norgespris-prod` (never overlaps prod) |
 
 **Steps of every workflow:**
 
 ```mermaid
 flowchart LR
-    c["Checkout"] --> l["Resolve landing<br/>directory"] --> e["setup_env.sh<br/>Python + Java"] --> lint["Lint<br/>ruff"] --> t["Unit tests<br/>pytest (55)"] --> r["Remove old<br/>_gold_summary.md"] --> run["python run_pipeline.py<br/>all / stage"]
+    c["Checkout"] --> l["Resolve landing<br/>directory"] --> e["setup_env.sh<br/>Python + Java"] --> lint["Lint<br/>ruff"] --> t["Unit tests<br/>pytest (65)"] --> r["Remove old<br/>_gold_summary.md"] --> run["python run_pipeline.py<br/>all / stage"]
     run --> a["Upload artifact<br/>_manifest.csv, _gold_summary.md<br/>(dev and prod workflows)"]
     run --> sum["Run summary<br/>manifest table +<br/>Gold checks"]
 ```
@@ -129,13 +156,14 @@ A failing lint or test stops the workflow **before** any data is touched.
 | `FROST_CLIENT_ID` | secret | Frost API |
 | `NORGESPRIS_PG_PASSWORD` | secret | PostgreSQL |
 | `NORGESPRIS_DEV_START_MONTH`, `_END_MONTH`, `NORGESPRIS_PROD_START_MONTH`, `_END_MONTH` | variables | period (defaults in each workflow) |
+| `NORGESPRIS_LOAD_MODE` | variable | `delta` (default) or `full` – see [§3](#full-and-delta-load) |
 | `NORGESPRIS_PG_HOST`, `_PORT`, `_USER` | variables | PostgreSQL connection (default `localhost`, `5432`, `norgespris`) |
 | `NORGESPRIS_SPARK_DRIVER_MEMORY` | variable | Spark heap (default `2g`) |
 | `SPARK_LOCAL_IP=127.0.0.1` | set in the workflow files | Spark networking on a runner service |
 
 **Security:** `permissions: contents: read`; no `pull_request` trigger (public repo + self-hosted runner); prod needs an approval.
 
-**Missed schedule:** a scheduled run only starts if the runner is online. If the machine was off on the 5th, start *Actions → Pipeline →
+**Missed schedule:** a scheduled run only starts if the runner is online. If the machine was off on the 7th, start *Actions → Pipeline →
 Run workflow* by hand.
 
 ## 6. Branches and releases
@@ -146,7 +174,7 @@ flowchart LR
     dw --> ddb[("norgespris_dev")]
     dev -- "pull request + review" --> main["branch main"]
     main -- "merge" --> pw["Prod workflow<br/>waits for approval"]
-    cron["5th of every month<br/>06:00 UTC"] --> sw["Scheduled workflow<br/>pipeline.yml"]
+    cron["7th of every month<br/>06:00 UTC"] --> sw["Scheduled workflow<br/>pipeline.yml"]
     main -. "code" .-> sw
     pw --> pdb[("norgespris_prod")]
     sw --> pdb
@@ -167,7 +195,9 @@ Commit messages: `type(layer): what` – e.g. `feat(gold): uptake table`, `fix(s
 | Silver failed | fix the cause (see [data-quality.md §7](data-quality.md#7-when-something-fails--runbook)), then `python run_pipeline.py silver` and `gold` |
 | Gold `blocked` | nothing is broken – the previous version is still live. Read `gold.check_results` for the run, fix, run `python run_pipeline.py gold` |
 | Need an earlier or longer period (backfill) | change `NORGESPRIS_<ENV>_START_MONTH` (`.env` or repository variable), run `all`: Bronze fetches the missing Frost months, Silver/Gold rebuild |
-| Landing folder deleted (`/tmp` cleaned) | run `all` – everything is downloaded again; Bronze tables are reloaded because the file fingerprints changed |
+| Landing folder deleted (`/tmp` cleaned) | run `all` – everything is downloaded again (also in delta mode: no manifest = first run); Bronze tables are replaced because a new full file arrived |
+| Delta keeps falling back to the full file | read the `warning: …` rows in `_manifest.csv`: month file not published yet (run after the 6th) or other columns (Elhub changed the format – then use `NORGESPRIS_LOAD_MODE=full` until the code is adapted) |
+| Force a complete reload | `NORGESPRIS_LOAD_MODE=full python run_pipeline.py all` |
 | A published Gold version is wrong | put the previous version back (below), then fix and run `gold` again |
 
 **Roll back Gold to the previous version** (one transaction; run as `norgespris` in `psql`):
@@ -196,7 +226,7 @@ COMMIT;
 |---|---|
 | Did the run succeed? | GitHub → *Actions* (green/red); exit code of `run_pipeline.py` |
 | What was downloaded? | run page summary (manifest table), artifact `_manifest.csv`, table `bronze.manifest` |
-| What was loaded into Bronze? | `bronze._load_log` |
+| What was loaded into Bronze? | `bronze._load_log` (per table), `bronze._load_files` (per landing file, `full` / `delta`) |
 | How good is Silver, compared with the last run? | `silver.quality_metrics`, `silver.rejects`; notebook 02 §5.2 |
 | Is a new Gold version live? Which checks failed? | `gold.publish_log`, `gold.check_results`; run page *Gold run summary*; `_gold_summary.md` in the landing folder |
 | How long did each step take? | the run log (each stage logs its time); `run_gold()` returns `timings_s` per table (notebook 03 §9) |
